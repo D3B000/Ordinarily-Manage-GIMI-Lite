@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# OMGLite 公开仓库 .gitignore
+# 原则：源码 / UI / 构建脚本 / 图标媒体 全提交；
+#       本地配置、日志、构建产物、以及「仪式(ritual)源码」不提交。
+# 注：ritual 的*编译产物*（ritual_bundle.pyd / _cython_analysis.pyd /
+#      pe_diversifier.dll / upx.exe）位于 src/omg/resources/binaries/ritual/，
+#     刻意保留并随包分发。其中 _cython_analysis.pyd 是 Cython BFS 加速模块：
+#     Nuitka 无法把扩展模块嵌进单一 bundle，故必须随包分发并由
+#     omg.core.ritual_loader.ensure_cython_analysis() 运行期注册。
+# ---------------------------------------------------------------------------
+
+# --- Python 缓存 / 字节码 ---
+__pycache__/
+*.pyc
+*.pyo
+*.so
+# 注意：不全局忽略 *.pyd —— ritual 的发布二进制 ritual_bundle.pyd 需要随公开仓库提交；
+#       ritual 源码里的 .pyd 已由下方 src/omg/domain/ritual/ 整目录排除覆盖。
+
+# --- 日志（OMGLite 有数百个 .log）---
+*.log
+log/
+
+# --- 构建 / 打包产物 ---
+build/
+dist/
+bin/
+cache/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+
+# --- 本地运行时配置（含本机路径，禁止公开）---
+config.json
+config.json.bak
+loader_config.json
+
+# --- 仪式(ritual) 源码：私有，不进公开仓库 ---
+src/omg/domain/ritual/
+
+# --- 以下文件刻意随包分发，不要忽略：---
+#     src/omg/resources/binaries/ritual/_cython_analysis.pyd  （Cython BFS 加速）
+
+# --- 运行时生成的 alchemy 数据（下载的工程 / 构建产物 / 云盘下载等）---
+src/omg/resources/alchemy/
+
+# --- 本地内存 / 工具数据 ---
+.workbuddy/
+
+_smoke_result*.txt
+_smoke_stdout*.txt
+
+# --- Windows 杂项 ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- 不公开到仓库的内部目录 / 脚本 ---
+docs/
+tests/
+_smoke*.py

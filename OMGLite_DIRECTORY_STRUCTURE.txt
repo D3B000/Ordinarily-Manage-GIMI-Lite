@@ -1,0 +1,78 @@
+OMGLite/src/omg/  (target layout per OMGDev/REFACTOR_PLAN.md, after Phase 5)
+├── core/
+│   ├── win32/
+│   │   └── __init__.py
+│   ├── __init__.py
+│   ├── config.default.json
+│   ├── config.py
+│   ├── download.py
+│   ├── logging_setup.py
+│   ├── paths.py
+│   └── updates.py
+├── domain/
+│   ├── inject/
+│   │   ├── __init__.py
+│   │   └── loader.py
+│   ├── media/
+│   │   ├── HoYoMediaExtractor.py
+│   │   ├── __init__.py
+│   │   └── auto_extract.py
+│   ├── modtools/
+│   │   ├── __init__.py
+│   │   ├── mod_optimizer.py
+│   │   └── texture_resizer.py
+│   ├── ritual/
+│   │   ├── prlib/
+│   │   │   ├── __init__.py
+│   │   │   ├── _cython_analysis.c
+│   │   │   ├── _cython_analysis.cp311-win_amd64.pyd
+│   │   │   ├── _cython_analysis.pyx
+│   │   │   ├── analysis.py
+│   │   │   ├── binary.py
+│   │   │   ├── cli.py
+│   │   │   ├── errors.py
+│   │   │   ├── pe.py
+│   │   │   ├── report.py
+│   │   │   ├── transform.py
+│   │   │   ├── types.py
+│   │   │   └── validate.py
+│   │   ├── __init__.py
+│   │   ├── d3d11InOMG.py
+│   │   └── d3d11_builder.py
+│   ├── upx/
+│   │   ├── __init__.py
+│   │   ├── runUpxPlus.py
+│   │   ├── upxBlurrer.py
+│   │   └── upxPlus.py
+│   └── __init__.py
+├── pages/
+│   ├── __init__.py
+│   ├── home.py
+│   └── setting.py
+├── resources/
+│   ├── binaries/
+│   │   └── ritual/
+│   └── icons/
+│       └── home/
+│           ├── genshin.svg
+│           ├── gi.svg
+│           ├── menu.svg
+│           ├── play.svg
+│           ├── setting.svg
+│           ├── tool.svg
+│           └── up.svg
+├── ui/
+│   ├── components/
+│   │   └── __init__.py
+│   ├── core/
+│   │   └── __init__.py
+│   ├── icons/
+│   │   └── __init__.py
+│   ├── theme/
+│   │   └── __init__.py
+│   ├── win95/
+│   │   └── __init__.py
+│   └── __init__.py
+├── __init__.py
+├── __main__.py
+└── app.py

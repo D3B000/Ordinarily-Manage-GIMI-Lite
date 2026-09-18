@@ -1,0 +1,31 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons">
+    <file>chevron-right.svg</file>
+    <file>circle_loading.svg</file>
+    <file>genshin_function_control_close.svg</file>
+    <file>starrail_function_control_close.svg</file>
+    <file>x.svg</file>
+    <file>xiala.svg</file>
+    <file>home/arrow-up.svg</file>
+    <file>home/change.svg</file>
+    <file>home/circle_loading.svg</file>
+    <file>home/genshin.svg</file>
+    <file>home/gi.svg</file>
+    <file>home/menu.svg</file>
+    <file>home/play.svg</file>
+    <file>home/setting.svg</file>
+    <file>home/tool.svg</file>
+    <file>home/up.svg</file>
+    <file>mm/ini.svg</file>
+    <file>mm/keyboard.svg</file>
+    <file>mm/pin.svg</file>
+    <file>mm/pinned.svg</file>
+    <file>mm/pinned_thumbtack_original.svg</file>
+    <file>mm/write.svg</file>
+    <file>quick_build/xiala-down-accent.svg</file>
+    <file>quick_build/xiala-down.svg</file>
+    <file>setting/add.svg</file>
+    <file>setting/delete.svg</file>
+  </qresource>
+</RCC>

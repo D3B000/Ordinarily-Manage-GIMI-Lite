@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- 旋转 spinner：白色圆环 + 间隙，由 StartButton 用 QTimer 每 80ms 旋转 -->
+  <circle cx="12" cy="12" r="9" fill="none" stroke="#FFFFFF" stroke-width="3"
+          stroke-linecap="round" stroke-dasharray="42 14.5" />
+</svg>
