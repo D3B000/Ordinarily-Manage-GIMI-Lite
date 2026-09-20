@@ -45,6 +45,23 @@ a = Analysis(
         "omg.domain.upx",
         "omg.ui",
         "omg.pages",
+        # --- ritual_bundle.pyd 内烘焙的 pefile 所需的标准库 ---
+        # pyd 是二进制，PyInstaller 不做静态分析，而应用自身没 import 过这些模块，
+        # 冻结后的 stdlib 因此不完整 —— pefile 在 pyd 内执行到 `import uuid` 时
+        # 报 ModuleNotFoundError（实报：pefile.py:34）。必须显式收集 pefile 的
+        # 全部顶层 stdlib 依赖；对已收集的模块重复声明无害（PyInstaller 会去重）。
+        # 注意：ordlookup 不要加 —— 它已随 pyd 烘焙进 bundle，且公开仓没有其源码，
+        # 加了只会报 "Hidden import not found"。
+        "codecs",
+        "collections",
+        "copy",
+        "functools",
+        "hashlib",
+        "os",
+        "string",
+        "struct",
+        "typing",
+        "uuid",
     ],
     hookspath=[],
     hooksconfig={},

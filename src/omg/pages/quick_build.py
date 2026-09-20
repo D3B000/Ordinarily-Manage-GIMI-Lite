@@ -1914,10 +1914,17 @@ class _ConfirmCleanupDialog(QDialog):
                 (os.path.basename(p) or p, path_size.get(p, 0)))
         scroll = QScrollArea(frame)
         scroll.setObjectName("ContentArea")
+        scroll.setStyleSheet(
+            "QScrollArea#ContentArea { background: transparent; border: none; }"
+        )
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setMaximumHeight(240)
         inner = QWidget(scroll)
+        # 深色底必须显式声明：未样式化的 QWidget 在全局 QSS 下会回退调色板白底，
+        # 在深色确认框中间糊出一大片白（与 setting.py 各滚动页同款处理）。
+        inner.setObjectName("PageContent")
+        inner.setStyleSheet("QWidget#PageContent { background: transparent; }")
         ilay = QVBoxLayout(inner)
         ilay.setContentsMargins(0, 0, 0, 0)
         ilay.setSpacing(6)

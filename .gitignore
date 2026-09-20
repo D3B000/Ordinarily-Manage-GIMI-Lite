@@ -47,6 +47,7 @@ src/omg/resources/alchemy/
 # --- 本地内存 / 工具数据 ---
 .workbuddy/
 
+# --- 冒烟测试输出（保留 _smoke_*.py 脚本，忽略结果文件）---
 _smoke_result*.txt
 _smoke_stdout*.txt
 
@@ -55,8 +56,3 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
-
-# --- 不公开到仓库的内部目录 / 脚本 ---
-docs/
-tests/
-_smoke*.py

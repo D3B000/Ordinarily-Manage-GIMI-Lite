@@ -21,8 +21,11 @@ browse_gimi_requested，以及 setter/getter set_game_path / get_game_path 等�
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 from typing import Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from omg.core.config import ConfigManager
@@ -66,6 +69,18 @@ LAUNCH_METHODS = ["native", "shell", "manual"]
 INJECT_MODES = ["hook", "inject", "bypass"]
 
 
+# d3dx.ini 运行时选项（hunting / show_warnings）的写入节奏。
+#
+# 这两个键若每次点击都写，用户来回拨动分段控件就是几十次全量改写
+# ——虽然单次只要几毫秒，但每次都在拿 truncate 中间态冒风险。改为「去抖合并」：
+# 突发改动合并成一次写盘。
+#
+# 上限窗口是为了防饿死：持续切换会不断重置去抖定时器，若没有上限，用户手不停
+# 就永远写不进去。达到上限时无条件落盘，之后再重新计一轮。
+D3DX_DEBOUNCE_MS = 400      # 连点合并窗口
+D3DX_MAX_DELAY_MS = 1500    # 上限：自首次改动算起最多拖这么久
+
+
 def _safe_index(options, value, default: int = 0) -> int:
     """把持久化的字符串值映射回分段控件索引；找不到时回落到 default。"""
     try:
@@ -93,6 +108,14 @@ class SettingsController:
                 "SettingsController 未收到共享的 ConfigManager，已新建独立实例；"
                 "设置改动不会同步到 LaunchController，启动/路径配置将无法生效。"
             )
+
+        # d3dx.ini 运行时选项的去抖写入容器（见 D3DX_DEBOUNCE_MS 注释）。
+        # 本控制器不是 QObject，故 QTimer 无 parent、由实例属性持有引用防 GC。
+        self._d3dx_timer = QTimer()
+        self._d3dx_timer.setSingleShot(True)
+        self._d3dx_timer.timeout.connect(self._flush_d3dx_runtime)
+        # 非 None 表示有挂起的改动，值为首次标记的 monotonic 时刻
+        self._d3dx_dirty_since: Optional[float] = None
 
     # ------------------------------------------------------------------
     # 绑定：把 UI 信号接到本控制器的方法
@@ -158,6 +181,14 @@ class SettingsController:
         omg.launch_hold_toggled.connect(self._on_omg_hold_toggled)
         omg.launch_hold_ms_changed.connect(self._on_omg_hold_ms_changed)
 
+        # ---- 窗口关闭收尾 ----
+        # hunting / show_warnings 是 d3dx.ini 里可热重载的键：游戏运行时改完
+        # ini 再按 3DMigoto 的 reload 键即可生效，所以关闭设置时要落盘，
+        # 而不是等下一次启动才写入。
+        closed_signal = getattr(window, "closed", None)
+        if closed_signal is not None:
+            closed_signal.connect(self._on_window_closed)
+
     # ------------------------------------------------------------------
     # 改动即生效：写入 ConfigManager 并落盘
     # ------------------------------------------------------------------
@@ -187,9 +218,11 @@ class SettingsController:
     # ------------------------------------------------------------------
     def _on_hunting_changed(self, index: int) -> None:
         self._save(KEY_HUNTING, str(index))
+        self.schedule_d3dx_runtime_write()
 
     def _on_warning_changed(self, index: int) -> None:
         self._save(KEY_WARNING, str(index))
+        self.schedule_d3dx_runtime_write()
 
     def _on_autocheck_changed(self, on: bool) -> None:
         self._save(KEY_AUTO_CHECK, 1 if on else 0)
@@ -322,6 +355,96 @@ class SettingsController:
         except ValueError:
             return False
         return common == os.path.realpath(base)
+
+    # ------------------------------------------------------------------
+    # 关闭设置窗口：把可热重载的 d3dx.ini 选项落盘
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # d3dx.ini 运行时选项：去抖写入
+    # ------------------------------------------------------------------
+    def schedule_d3dx_runtime_write(self) -> None:
+        """标记 hunting / show_warnings 已改动，合并成一次写盘。
+
+        立即写会随连点产生十几次全量改写；这里用单次定时器把突发改动收敛为一次。
+        同时受 ``D3DX_MAX_DELAY_MS`` 约束，避免连续切换导致写入被无限推迟。
+        """
+        now = time.monotonic()
+        if self._d3dx_dirty_since is None:
+            self._d3dx_dirty_since = now
+
+        elapsed_ms = (now - self._d3dx_dirty_since) * 1000.0
+        if elapsed_ms >= D3DX_MAX_DELAY_MS:
+            # 已拖到上限：立刻落盘，不继续让用户带待写状态
+            self.flush_d3dx_runtime_options()
+            return
+
+        self._d3dx_timer.start(
+            int(min(D3DX_DEBOUNCE_MS, D3DX_MAX_DELAY_MS - elapsed_ms))
+        )
+
+    def flush_d3dx_runtime_options(self) -> bool:
+        """立即执行挂起的 d3dx.ini 写入（关窗 / 达到去抖上限时调用）。
+
+        Returns:
+            与 :meth:`apply_d3dx_runtime_options` 一致：True 表示确有改动并写盘。
+        """
+        self._d3dx_timer.stop()
+        self._d3dx_dirty_since = None
+        return self.apply_d3dx_runtime_options()
+
+    def _flush_d3dx_runtime(self) -> None:
+        """QTimer 超时回调。"""
+        self.flush_d3dx_runtime_options()
+
+    def _on_window_closed(self) -> None:
+        """设置窗口关闭时的收尾：把可能仍挂起的改动立刻落盘。
+
+        去抖窗口期内关窗也不能丢改动，所以这里走即时 flush（无 dirty 时由
+        ``apply_d3dx_runtime_options`` 的幂等判断直接跳过，不会白写一次盘）。
+        """
+        try:
+            self.flush_d3dx_runtime_options()
+        except Exception as e:
+            logger.warning("关闭设置时的收尾操作失败: %s", e)
+
+    def apply_d3dx_runtime_options(self) -> bool:
+        """把 hunting / show_warnings 写进 GIMI 的 d3dx.ini（幂等）。
+
+        即便游戏正在运行也会写入：这两个键 3DMigoto 注册为 reloadable，改完后
+        在游戏里按 reload 键即可生效。幂等——值没变就不动文件。
+
+        Returns:
+            True 表示确有改动并写盘；False 表示跳过（未配置 / 无 ini / 值一致 / 失败）。
+        """
+        gimi_dir = (self.cfg.get(KEY_GIMI, "") or "").strip()
+        if not gimi_dir or not os.path.isdir(gimi_dir):
+            return False
+
+        ini_path = Path(gimi_dir) / "d3dx.ini"
+        if not ini_path.is_file():
+            return False
+
+        hunting = int(self.cfg.get(KEY_HUNTING, 0) or 0)
+        warning = int(self.cfg.get(KEY_WARNING, 0) or 0)
+
+        try:
+            # 惰性导入：loader 只在真正需要写 ini 时才加载
+            from omg.domain.inject.loader import patch_d3dx_runtime_options
+            changed = patch_d3dx_runtime_options(ini_path, hunting, warning)
+        except Exception as e:
+            logger.warning("写入 d3dx.ini 失败: %s", e)
+            return False
+
+        if changed:
+            # 用户选择「游戏中也照写」，但必须把生效路径讲清楚：改文件本身不会
+            # 立刻改变 3DMigoto 的运行状态，它要等到 reload 或下次启动才读。
+            logger.info(
+                "d3dx.ini 已写入 hunting=%s, show_warnings=%s；3DMigoto 需在游戏内"
+                "按 F10 (reload_config) 或下次启动后才读取新值，届时游戏中用小键盘 0"
+                "热键切换出的 hunting 状态会被这里写入的值覆盖",
+                hunting, warning,
+            )
+        return changed
 
     # ------------------------------------------------------------------
     # 浏览对话框

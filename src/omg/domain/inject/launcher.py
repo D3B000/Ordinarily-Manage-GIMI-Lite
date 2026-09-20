@@ -35,6 +35,7 @@ class StartRequest:
     start_args: List[str] = field(default_factory=list)
     work_dir: Optional[str] = None
     use_hook: bool = True                  # True=WH_CBT 钩子；False=直接注入
+    use_xxmi_dll: bool = True              # False=bypass：不注入 d3d11.dll（额外库照常注入）
     custom_launch_cmd: Optional[str] = None  # 自定义启动命令（覆盖 exe_path）
     inject_dll_paths: List[Path] = field(default_factory=list)  # 额外要注入的 DLL
     process_priority: str = 'NORMAL_PRIORITY_CLASS'  # ProcessPriority 枚举名
@@ -51,6 +52,7 @@ class LaunchContext:
     work_dir: Optional[str]
     process_flags: int
     use_hook: bool
+    use_xxmi_dll: bool
     custom_launch_cmd: Optional[str]
     xxmi_dll_path: Path
     inject_dll_paths: List[Path]
@@ -90,6 +92,7 @@ class MigotoInjector:
             work_dir=request.work_dir,
             process_flags=process_flags,
             use_hook=request.use_hook,
+            use_xxmi_dll=request.use_xxmi_dll,
             custom_launch_cmd=request.custom_launch_cmd,
             xxmi_dll_path=Path(request.xxmi_dll_path),
             inject_dll_paths=list(request.inject_dll_paths),
@@ -147,10 +150,14 @@ class MigotoInjector:
         context = self.context
 
         dll_paths: List[Path] = []
-        if context.xxmi_dll_path and context.xxmi_dll_path.is_file():
-            # 若 xxmi dll 已在额外列表里则不重复
-            if context.xxmi_dll_path not in context.inject_dll_paths:
-                dll_paths.append(context.xxmi_dll_path)
+        # bypass（use_xxmi_dll=False）不注入 d3d11.dll —— 与 XXMI 的
+        # `is_xxmi_dll_used()` 判定等价、与旧路径 `_hook_method(bypass=True)` 一致。
+        # 例外：用户若在「额外注入库」里显式列了 d3d11.dll，仍按用户要求注入。
+        if context.use_xxmi_dll:
+            if context.xxmi_dll_path and context.xxmi_dll_path.is_file():
+                # 若 xxmi dll 已在额外列表里则不重复
+                if context.xxmi_dll_path not in context.inject_dll_paths:
+                    dll_paths.append(context.xxmi_dll_path)
         dll_paths += list(context.inject_dll_paths)
 
         if dll_paths:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -37,6 +38,42 @@ from .types import LaunchState, LaunchTask
 from .worker import LaunchWorker
 
 logger = logging.getLogger("OMG")
+
+# cmd.exe 内建命令：它们不是 exe，工作目录无从推导，回退到游戏目录
+_SHELL_BUILTINS = {"start", "cmd", "cmd.exe"}
+
+
+def _resolve_work_dir(custom_cmd: Optional[str], game_exe: Path) -> str:
+    """决定被启动进程的工作目录（CWD）。
+
+    默认取游戏 exe 所在目录 —— 与 XXMI 一致（``get_start_cmd()`` 恒返回
+    ``str(game_exe_path.parent)``）。不设的话进程会继承 OMGLite 自己的 CWD，
+    游戏用相对路径读写配置 / 崩溃转储时会落到别处，DLL 搜索顺序也会受影响。
+
+    自定义启动时，若命令的首个 token 能解析成一个真实存在的 exe，则用**该 exe
+    的目录**：FPS 解锁器这类第三方启动器常按相对路径找自己的配置，工作目录设成
+    游戏目录会让它找不到。解析不出来（cmd 内建命令、相对命令、路径不存在）时
+    回退游戏目录。
+
+    ``shlex.split(..., posix=False)`` 是必须的：posix 模式会把 Windows 路径里的
+    ``\\`` 当转义符吃掉。
+    """
+    game_dir = str(Path(game_exe).parent)
+    if not custom_cmd:
+        return game_dir
+    try:
+        tokens = shlex.split(custom_cmd, posix=False)
+    except ValueError:  # 引号不配对等
+        return game_dir
+    if not tokens:
+        return game_dir
+    head = (tokens[0] or "").strip('"').strip("'")
+    if not head or Path(head).name.lower() in _SHELL_BUILTINS:
+        return game_dir
+    candidate = Path(head)
+    if candidate.is_file():
+        return str(candidate.parent)
+    return game_dir
 
 
 class LaunchController(QObject):
@@ -230,12 +267,18 @@ class LaunchController(QObject):
         use_hook = (effective_mode == "hook")
 
         # ============ d3dx.ini patch 参数 ============
-        if resolved_cmd:
-            launch_val = resolved_cmd
-        elif launch_method != "manual":
-            launch_val = str(game_exe)
-        else:
-            launch_val = ""
+        # [Loader] launch 一律不写（传 None = 本次不参与写入）。
+        #
+        # launch 的真实消费者是 3DMigoto Loader.exe（GIMI 目录下那个独立程序），
+        # 它的二进制里有 `3DMigoto ready, launching "%s"` 和
+        # `Invalid launch setting` —— 空值会让 Loader.exe 直接报错。它不属于
+        # OMGLite 的启动链路（d3d11.dll 与 3dmloader.dll 都不解析该键），
+        # OMGLite 写它只会破坏用户手配的启动命令（例如 FPS 解锁器）。
+        #
+        # 「用别的程序拉起游戏」由「自定义启动」输入框承担，等价于 XXMI 的
+        # get_start_cmd() / unlock_fps 换 start_exe_path —— 启动器层面解决，
+        # 不经过 ini。这与 XXMI 一致（其 update_d3dx_ini 只写 Loader.target）。
+        launch_val = None
         # loader=当前进程名（与 Hook/Direct 注入时 d3d11 的 DllMain 校验一致）
         loader_val = os.path.basename(sys.executable)
 
@@ -252,7 +295,12 @@ class LaunchController(QObject):
             process_name=target,
             exe_path=Path(game_exe),
             xxmi_dll_path=d3d11_path,
+            # 工作目录：与 XXMI 的 get_start_cmd() 一致，默认游戏目录；
+            # 自定义启动能解析出 exe 时用该 exe 的目录（详见 _resolve_work_dir）
+            work_dir=_resolve_work_dir(resolved_cmd, Path(game_exe)),
             use_hook=use_hook,
+            # bypass = 只启动游戏、不注入 d3d11.dll（额外注入库仍照常注入）
+            use_xxmi_dll=(effective_mode != "bypass"),
             custom_launch_cmd=resolved_cmd,
             inject_dll_paths=extra_dll_paths,
             process_start_method=launch_method.upper(),

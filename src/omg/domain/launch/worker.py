@@ -54,7 +54,8 @@ class LaunchWorker(QThread):
             self.finished.emit(False, f"找不到 d3dx.ini: {ini_path}")
             return
         try:
-            patch_d3dx_ini(
+            # 幂等：所有目标值与现值一致时不会写盘，返回值用于区分「已更新 / 无需改动」
+            changed = patch_d3dx_ini(
                 ini_path,
                 task.d3dx_target,
                 task.d3dx_hunting,
@@ -62,12 +63,22 @@ class LaunchWorker(QThread):
                 launch=task.d3dx_launch,
                 loader=task.d3dx_loader,
             )
-            logger.info(
-                "d3dx.ini 已更新: target=%s, hunting=%s, show_warnings=%s, "
-                "launch=%s, loader=%s",
-                task.d3dx_target, task.d3dx_hunting, task.d3dx_warning,
-                task.d3dx_launch or "(空)", task.d3dx_loader,
-            )
+            if changed:
+                logger.info(
+                    "d3dx.ini 已更新: target=%s, hunting=%s, show_warnings=%s, "
+                    "launch=%s, loader=%s",
+                    task.d3dx_target, task.d3dx_hunting, task.d3dx_warning,
+                    task.d3dx_launch if task.d3dx_launch is not None else "(保持原样)",
+                    task.d3dx_loader,
+                )
+            else:
+                logger.info(
+                    "d3dx.ini 无需改动（目标值与现值一致）: target=%s, hunting=%s, "
+                    "show_warnings=%s, launch=%s, loader=%s",
+                    task.d3dx_target, task.d3dx_hunting, task.d3dx_warning,
+                    task.d3dx_launch if task.d3dx_launch is not None else "(保持原样)",
+                    task.d3dx_loader,
+                )
         except Exception as e:  # patch 失败不致命，仍尝试注入
             logger.error("修改 d3dx.ini 失败: %s", e)
 

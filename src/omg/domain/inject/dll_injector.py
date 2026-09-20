@@ -197,7 +197,11 @@ class DllInjector:
             if cmd is None:
                 self.start_process(exe_path, work_dir, ' '.join(start_args or []))
             else:
-                self.start_process('cmd.exe', None, f'/C "{cmd}"')
+                # 自定义命令交给 cmd.exe 执行。此处把 work_dir 透传下去
+                # （XXMI 在这里传 None，会让 cmd.exe 继承启动器自己的 CWD）；
+                # 装配层已保证 work_dir 是存在的目录——要么是游戏目录，要么是
+                # 命令里那个 exe 的目录，两者都经预检校验过。
+                self.start_process('cmd.exe', work_dir, f'/C "{cmd}"')
 
         elif start_method == 'MANUAL':
             log.debug('Waiting for user to start the game process %s...', process_name)
@@ -353,7 +357,7 @@ class DllInjector:
                             raise InjectorError(L('error_dll_injector_extra_library_failed', """
                                 Failed to inject extra library {dll_path}:
                                 {error_text}!
-                                Please check Advanced Settings -> Inject Libraries.
+                                Please check Settings -> Startup -> Inject Libraries.
                             """).format(dll_path=dll_path, error_text=error_text))
                     else:
                         log.debug('Successfully injected DLL to process %s (PID: %s): %s',

@@ -35,7 +35,7 @@ class LaunchTask:
     d3dx_target: str              # [Loader] target = 游戏进程名
     d3dx_hunting: int             # [Hunting] hunting
     d3dx_warning: int             # [Logging] show_warnings
-    d3dx_launch: str              # [Loader] launch = 游戏 exe 路径（manual 留空）
+    d3dx_launch: "Optional[str]"  # [Loader] launch；None = 本次不碰该键（自定义/manual）
     d3dx_loader: str              # [Loader] loader = 当前进程名（与 Hook/Direct 校验一致）
     injector_path: str            # 3dmloader.dll 完整路径
     request: "StartRequest"       # 引擎层 StartRequest

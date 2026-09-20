@@ -1545,14 +1545,16 @@ class HomeWindow(CenteredPopupMixin, QWidget):
         self._sync_child_hold()
 
     def _build_tool_menu(self) -> QMenu:
-        """工具按钮下拉菜单：含「便捷构建」与「资源浏览」入口。
+        """工具按钮下拉菜单：含「便捷构建」（hammer）与「资源浏览」（square-library）。
 
+        两项都带图标，与主菜单（#2）的「设置 / 置顶」一致：图标经 ``_svg_icon``
+        统一染成 ``ICON_COLOR``（白色）剪影，尺寸同为 14px。
         与菜单按钮（#2）保持一致，使用 setMenu 在点击时弹出。
         """
         menu = QMenu(self)
-        act_build = menu.addAction("便捷构建")
+        act_build = menu.addAction(_svg_icon("hammer.svg", 14), "便捷构建")
         act_build.triggered.connect(self._on_quick_build)
-        act_res = menu.addAction("资源浏览")
+        act_res = menu.addAction(_svg_icon("square-library.svg", 14), "资源浏览")
         act_res.triggered.connect(self._on_resources)
         return menu
 

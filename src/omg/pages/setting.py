@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QPushButton,
     QVBoxLayout, QWidget, QStackedWidget, QLineEdit,
     QScrollArea, QListWidget, QListWidgetItem, QPlainTextEdit,
+    QGridLayout,
 )
 from omg.core.window_behavior import (
     DEFAULT_IDLE_OPACITY, MAX_IDLE_OPACITY, MIN_IDLE_OPACITY,
@@ -120,6 +121,87 @@ def tinted_icon(filename: str, px: int, color: str) -> QIcon:
     """
     from omg.ui.icon_loader import tinted_icon as _tinted_icon
     return _tinted_icon(filename, px, color)
+
+
+# ===========================================================================
+# 说明气泡的小问号图标（label 之后，悬浮查看说明 / 示例）
+# ===========================================================================
+HELP_ICON = "circle-question-mark.svg"
+HELP_ICON_PX = 16                 # 图形尺寸（= 占位宽，不留居中呼吸边）
+HELP_ICON_BOX = 16                # 控件占位（图形居中，四周留呼吸边）
+HELP_ICON_GAP = 3                 # 与前一个 label 的间距（行布局 spacing 为 8，
+                                  # 直接塞进同一行的实际间距会是 8+gap，故
+                                  # label + 图标打包进独立的子布局，见
+                                  # ``add_help_icon``）
+HELP_ICON_COLOR = TEXT_SECONDARY  # 常态：次要文字色，不与 label 抢视觉
+HELP_ICON_COLOR_HOVER = TEXT_PRIMARY
+
+
+class HelpIcon(QLabel):
+    """label 后面的小问号：悬浮显示该项的说明与示例。
+
+    为什么不直接给控件设 toolTip：那样鼠标一进输入框 / 分段控件就弹卡，既挡
+    住输入又不好收起（说明本身是长文本）。挂到 16px 的问号上后热区小而明确，
+    说明按需查看，控件交互不受影响。
+
+    图标是 lucide 线稿（``stroke="currentColor"``），而 Qt 的 ``QSvgRenderer``
+    不解析 ``currentColor`` —— 直接渲染会回退成黑色，深色主题下几乎不可见。
+    故一律经 ``tinted_icon`` 按主题色重绘；悬浮时提亮一档作为反馈。
+    """
+
+    def __init__(self, tip: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(HELP_ICON_BOX, HELP_ICON_BOX)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self._tip = tip or ""
+        if self._tip:
+            self.setToolTip(self._tip)
+            # 交互型气泡：卡内可拖选 / 复制示例，点击卡外或 Esc 关闭
+            self.setProperty("tipInteractive", True)
+        self._repaint(HELP_ICON_COLOR)
+
+    def _repaint(self, color: str) -> None:
+        icon = tinted_icon(HELP_ICON, HELP_ICON_PX, color)
+        if not icon.isNull():
+            self.setPixmap(icon.pixmap(HELP_ICON_PX, HELP_ICON_PX))
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._repaint(HELP_ICON_COLOR_HOVER)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._repaint(HELP_ICON_COLOR)
+        super().leaveEvent(event)
+
+
+def add_help_icon(row, label: QWidget, tip: str, parent: QWidget) -> HelpIcon:
+    """把 ``label`` 与问号图标打包进一个子布局，放回 ``label`` 原来的位置。
+
+    为什么包一层：图标若直接塞进行布局，它与 label 的实际间距 = 行布局
+    ``spacing``（8）+ 图标自身留白，怎么调都偏宽。子布局的外边距归零、
+    spacing 就是**精确的** label↔图标间距。
+
+    ``row`` 传 ``None`` 时不做行内替换（例如调用方随后要把整体放进
+    ``QGridLayout``），由调用方自行安排 ``icon.parent()``（即打包容器）。
+    """
+    idx = row.indexOf(label) if row is not None else -1
+    if row is not None and idx >= 0:
+        row.removeWidget(label)
+    box = QWidget(parent)
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(HELP_ICON_GAP)
+    lay.addWidget(label)
+    icon = HelpIcon(tip, box)
+    lay.addWidget(icon)
+    if row is None:
+        return icon
+    if idx >= 0:
+        row.insertWidget(idx, box)
+    else:
+        row.addWidget(box)
+    return icon
 
 
 # ===========================================================================
@@ -519,6 +601,16 @@ class SegmentedControl(QWidget):
             if b.style():
                 b.style().polish(b)
 
+    def setToolTip(self, tip: str) -> None:  # type: ignore[override]
+        """提示气泡由子按钮接收，必须同步下发。
+
+        ``install_pop_cards`` 靠 ``QEvent.Enter`` 取 **鼠标所在控件** 的 toolTip，
+        而鼠标进入的是内部的 QPushButton —— 只给外层设的话永远取不到。
+        """
+        super().setToolTip(tip)
+        for b in self._btns:
+            b.setToolTip(tip)
+
 
 # ===========================================================================
 # 开关（圆角轨道 + 白色旋钮）
@@ -847,49 +939,56 @@ class PathPage(QWidget):
         card = Card("路径配置", self)
         body = card.body_layout
 
-        # ---------------- 游戏路径 ----------------
-        row_game = QHBoxLayout()
-        row_game.setSpacing(8)
+        # ---------------- 路径两行（网格布局） ----------------
+        # 用 QGridLayout 而不是两条独立 QHBoxLayout：列 0 的宽度自动取
+        # 「游戏 label + 问号」整体与「GIMI」label 的较大者 —— 两行输入框
+        # 左缘 / 浏览按钮天然对齐，且「游戏+问号」的视觉间距仍是子布局里
+        # 精确的 3px。靠手设固定宽对齐会在改字号 / 换字体时悄悄错位。
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(10)
+
+        # ---- 行 1：游戏路径 ----
         lbl_game = QLabel("游戏", self)
         lbl_game.setObjectName("FieldLabel")
-        lbl_game.setFixedWidth(40)
-        row_game.addWidget(lbl_game)
 
-        # 「游戏」悬浮指引卡（动图 + 说明文字）。必须持有引用，否则构造结束后
-        # 控制器与 QMovie 会被回收，卡片内容变空白 / 动图不播。
-        self._game_guide = attach_game_folder_guide(lbl_game)
+        # 「游戏」悬浮指引卡（动图 + 说明文字）：触发点同样收口到 label 后的小
+        # 问号（tip 为空 —— 说明由指引卡自身承载，不另走 toolTip 气泡，避免同
+        # 一处弹出两张卡）。必须持有引用，否则构造结束后控制器与 QMovie 会被
+        # 回收，卡片内容变空白 / 动图不播。
+        self._help_game = add_help_icon(None, lbl_game, "", self)
+        self._game_guide = attach_game_folder_guide(self._help_game)
+        grid.addWidget(self._help_game.parent(), 0, 0)
 
         self._edit_game = QLineEdit(self)
         self._edit_game.setPlaceholderText("选择游戏所在文件夹...")
         self._edit_game.textChanged.connect(self.game_path_changed)
-        row_game.addWidget(self._edit_game, 1)
+        grid.addWidget(self._edit_game, 0, 1)
 
         btn_game = QPushButton("浏览", self)
         btn_game.setObjectName("BrowseBtn")
         btn_game.setCursor(Qt.PointingHandCursor)
         btn_game.clicked.connect(self.browse_game_requested)
-        row_game.addWidget(btn_game)
-        body.addLayout(row_game)
+        grid.addWidget(btn_game, 0, 2)
 
-        # ---------------- GIMI 路径 ----------------
-        row_gimi = QHBoxLayout()
-        row_gimi.setSpacing(8)
+        # ---- 行 2：GIMI 路径 ----
         lbl_gimi = QLabel("GIMI", self)
         lbl_gimi.setObjectName("FieldLabel")
-        lbl_gimi.setFixedWidth(40)
-        row_gimi.addWidget(lbl_gimi)
+        grid.addWidget(lbl_gimi, 1, 0)
 
         self._edit_gimi = QLineEdit(self)
         self._edit_gimi.setPlaceholderText("选择 GIMI 目录...")
         self._edit_gimi.textChanged.connect(self.gimi_path_changed)
-        row_gimi.addWidget(self._edit_gimi, 1)
+        grid.addWidget(self._edit_gimi, 1, 1)
 
         btn_gimi = QPushButton("浏览", self)
         btn_gimi.setObjectName("BrowseBtn")
         btn_gimi.setCursor(Qt.PointingHandCursor)
         btn_gimi.clicked.connect(self.browse_gimi_requested)
-        row_gimi.addWidget(btn_gimi)
-        body.addLayout(row_gimi)
+        grid.addWidget(btn_gimi, 1, 2)
+
+        body.addLayout(grid)
 
         layout.addWidget(card)
 
@@ -1112,28 +1211,101 @@ class GimiPage(QWidget):
 # ===========================================================================
 # 启动页（UI；功能由 omg.domain.settings.SettingsController 后续绑定）
 # ===========================================================================
-# 自定义启动命令输入框的详细帮助（由 OMGTips 以多行纯文本气泡呈现）
+# ---------------------------------------------------------------------------
+# 启动页四段提示气泡（由 install_pop_cards 以多行纯文本气泡呈现）
+#
+# 这些说明**不再直接挂在控件上**（会干扰输入 / 点击），而是挂在各行 label 后面
+# 的小问号图标 ``HelpIcon`` 上，悬浮图标才显示。
+#
+# 排版约束：气泡宽度 = 最长行的文本宽度，换行必须手写（不自动折行），
+# 因此每行控制在 ~24 个汉字 / ~48 个 ASCII 字符以内。
+# ---------------------------------------------------------------------------
 _TIP_CUSTOM_LAUNCH_CMD = (
     "自定义启动命令 · 填写说明\n"
     "────────────────────\n"
-    "用途：整条作为 Windows 命令行执行，\n"
-    "覆盖默认启动游戏 exe（仅本开关打开时生效）。\n"
-    "适合用自定义启动器 / 批处理 / 带参命令行启动。\n"
+    "用途：OMGLite 直接执行这条命令来启动\n"
+    "游戏，替代默认的「启动游戏 exe」。\n"
+    "典型场景：FPS 解锁器 / 第三方启动器 /\n"
+    "批处理 / 带参数启动。\n"
     "\n"
-    "格式：可执行路径 + 参数，以空格分隔；\n"
-    "路径含空格须用英文双引号 \" 包裹。\n"
-    "支持 .exe / .bat / .cmd，可用 %环境变量% 与 start。\n"
+    "生效条件：开关打开且命令非空。\n"
+    "注意：启动方法选 Manual 时本命令不会\n"
+    "执行（Manual = 你自己去开游戏）。\n"
     "\n"
-    "长度：建议 ≤ 8191 字符（Windows 命令行上限）。\n"
+    "执行方式：整条交给 cmd.exe 运行，因此\n"
+    "支持 start、%环境变量%、重定向等语法。\n"
+    "路径含空格须用英文双引号 \" 包裹；\n"
+    "引号较复杂时建议启动方法选 Native。\n"
     "\n"
-    "示例 1（无空格路径，引号可省略）：\n"
-    "D:\\Games\\Genshin Impact\\launcher.exe\n"
+    "工作目录：取命令里那个 exe 所在目录；\n"
+    "识别不出（如 start）时用游戏目录。\n"
     "\n"
-    "示例 2（运行批处理并传参）：\n"
-    "D:\\Tools\\start_game.bat --account test\n"
+    "不会改动 d3dx.ini：[Loader] launch 原样\n"
+    "保留，本命令只由 OMGLite 使用。\n"
     "\n"
-    "示例 3（含空格路径必须用引号包裹）：\n"
-    "\"D:\\My Games\\Genshin Impact\\GenshinImpact.exe\" -windowed -noborder"
+    "示例 1（FPS 解锁器，路径无空格）：\n"
+    "G:\\Tools\\GIFpsUnlocker\\loader.exe\n"
+    "\n"
+    "示例 2（含空格路径必须用引号）：\n"
+    "\"D:\\My Games\\Launcher.exe\" -windowed\n"
+    "\n"
+    "示例 3（用 start 指定工作目录）：\n"
+    "start /d \"G:\\Tools\\GIFpsUnlocker\" loader.exe"
+)
+
+_TIP_START_METHOD = (
+    "启动方法 · 说明\n"
+    "────────────────────\n"
+    "Native  直接 CreateProcess 启动（推荐）\n"
+    "Shell   交给 3DMigoto 的 StartProcess\n"
+    "        （ShellExecute）启动\n"
+    "Manual  OMGLite 不启动游戏，只装好\n"
+    "        钩子等你手动打开\n"
+    "\n"
+    "三者都会等待游戏窗口出现再继续。\n"
+    "注：自定义启动命令在 Manual 下不执行。"
+)
+
+_TIP_INJECT_METHOD = (
+    "注入方式 · 说明\n"
+    "────────────────────\n"
+    "仅在「自定义启动」开启时生效；\n"
+    "关闭自定义启动时固定为 Hook。\n"
+    "\n"
+    "Hook    装全局钩子，游戏一启动就把\n"
+    "        d3d11.dll 挂进去（推荐）\n"
+    "Inject  启动后用远程线程把 d3d11.dll\n"
+    "        写入目标进程\n"
+    "Bypass  只启动游戏，不注入 d3d11.dll\n"
+    "        （「注入库」里列的 DLL 仍注入）"
+)
+
+_TIP_EXTRA_LIBRARIES = (
+    "注入库 · 填写说明\n"
+    "────────────────────\n"
+    "用途：除 d3d11.dll 之外，再往游戏进程\n"
+    "里注入额外的 DLL（ReShade 等）。\n"
+    "\n"
+    "格式：每行一个路径，空行自动跳过；\n"
+    "按书写顺序依次注入。\n"
+    "\n"
+    "路径：建议写完整绝对路径。相对路径按\n"
+    "OMGLite 当前工作目录解析，容易取错。\n"
+    "\n"
+    "与注入方式的关系：\n"
+    "Hook / Inject  先注入 d3d11.dll，再注入\n"
+    "               这里列出的库\n"
+    "Bypass         d3d11.dll 不注入，但这里\n"
+    "               列出的库照常注入\n"
+    "\n"
+    "注意：路径不会提前校验，文件不存在会\n"
+    "在注入阶段报错并中止启动。\n"
+    "\n"
+    "示例 1（ReShade，绝对路径）：\n"
+    "C:\\Games\\ReShade\\ReShade64.dll\n"
+    "\n"
+    "示例 2（Bypass 下仍要用 3DMigoto）：\n"
+    "G:\\Tools\\GIMI\\d3d11.dll"
 )
 
 
@@ -1177,8 +1349,11 @@ class StartupPage(QWidget):
         row_method.setSpacing(8)
         lbl_method = QLabel("启动方法", content)
         lbl_method.setObjectName("FieldLabel")
-        lbl_method.setFixedWidth(60)
+        # 不设固定宽：宽出文本的空白会算进 label↔问号的视觉间距
         row_method.addWidget(lbl_method)
+        # 说明挂在 label 后的小问号上，不挂在分段控件上（否则一进控件就弹卡）
+        self._help_method = add_help_icon(row_method, lbl_method,
+                                          _TIP_START_METHOD, content)
         row_method.addStretch()
         self._seg_method = SegmentedControl(["Native", "Shell", "Manual"], content)
         self._seg_method.currentChanged.connect(self.method_changed)
@@ -1202,6 +1377,8 @@ class StartupPage(QWidget):
         lbl_custom = QLabel("自定义启动", content)
         lbl_custom.setObjectName("FieldLabel")
         row_custom_head.addWidget(lbl_custom)
+        self._help_custom = add_help_icon(row_custom_head, lbl_custom,
+                                          _TIP_CUSTOM_LAUNCH_CMD, content)
         row_custom_head.addStretch()
         self._switch_custom = Switch(content)
         self._switch_custom.toggled.connect(self._on_custom_toggled)
@@ -1215,12 +1392,7 @@ class StartupPage(QWidget):
         lay_body_custom.setSpacing(8)
 
         self._edit_custom_cmd = QLineEdit(content)
-        self._edit_custom_cmd.setPlaceholderText("自定义启动命令 / 参数...")
-        self._edit_custom_cmd.setToolTip(_TIP_CUSTOM_LAUNCH_CMD)
-        # 交互型提示（OMGPopCard.HOVER_INTERACTIVE）：鼠标移入卡片不隐藏，
-        # 可自由拖选 / 复制说明文字；移出「输入框 + 卡片」、点击卡外或按
-        # Esc 时才关闭。tipInteractive 隐含可选中（tipSelectable）。
-        self._edit_custom_cmd.setProperty("tipInteractive", True)
+        self._edit_custom_cmd.setPlaceholderText("例：G:\\Tools\\Launcher.exe -windowed")
         self._edit_custom_cmd.textChanged.connect(self.custom_cmd_changed)
         lay_body_custom.addWidget(self._edit_custom_cmd)
 
@@ -1230,8 +1402,9 @@ class StartupPage(QWidget):
         row_inject.setSpacing(8)
         lbl_inject = QLabel("注入方式", content)
         lbl_inject.setObjectName("FieldLabel")
-        lbl_inject.setFixedWidth(60)
         row_inject.addWidget(lbl_inject)
+        self._help_inject = add_help_icon(row_inject, lbl_inject,
+                                          _TIP_INJECT_METHOD, content)
         row_inject.addStretch()
         self._seg_inject = SegmentedControl(["Hook", "Inject", "Bypass"], content)
         self._seg_inject.currentChanged.connect(self.inject_method_changed)
@@ -1252,6 +1425,8 @@ class StartupPage(QWidget):
         lbl_lib = QLabel("注入库", content)
         lbl_lib.setObjectName("FieldLabel")
         row_lib_head.addWidget(lbl_lib)
+        self._help_lib = add_help_icon(row_lib_head, lbl_lib,
+                                       _TIP_EXTRA_LIBRARIES, content)
         row_lib_head.addStretch()
         self._switch_lib = Switch(content)
         self._switch_lib.toggled.connect(self._on_lib_toggled)
@@ -1265,7 +1440,7 @@ class StartupPage(QWidget):
         lay_body_lib.setSpacing(8)
 
         self._edit_lib = QPlainTextEdit(content)
-        self._edit_lib.setPlaceholderText("每行一个注入库路径 / 名称...")
+        self._edit_lib.setPlaceholderText("每行一个 DLL 绝对路径...")
         self._edit_lib.setFixedHeight(90)
         self._edit_lib.textChanged.connect(
             lambda: self.lib_text_changed.emit(self._edit_lib.toPlainText())
@@ -1682,6 +1857,10 @@ class SettingsWindow(CenteredPopupMixin, QWidget):
     本窗口**不**持有 ConfigManager，也不实现「应用 / 取消」。
     """
 
+    # 窗口关闭（点标题栏关闭 / Esc / 系统关闭）。domain 层接此信号做收尾，
+    # 例如把 hunting / show_warnings 写进 d3dx.ini（游戏运行中也要写）。
+    closed = Signal()
+
     def __init__(self, parent: Optional[QWidget] = None, config: Optional[object] = None,
                  tray_mode: bool = False) -> None:
         # 任务栏策略（2026-09-18 改）：**仅首页**不进任务栏，其它页面一律显示。
@@ -1813,6 +1992,11 @@ class SettingsWindow(CenteredPopupMixin, QWidget):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        # 先通知 domain 层收尾（写 d3dx.ini 等），再走默认关闭流程
+        try:
+            self.closed.emit()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
