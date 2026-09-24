@@ -169,7 +169,8 @@ def _sort_key(entry: dict):
 # 拉取 release 列表
 # ---------------------------------------------------------------------------
 def fetch_releases(limit: int = RELEASE_LIMIT,
-                   status_cb: Optional[Callable[[str], None]] = None) -> list:
+                   status_cb: Optional[Callable[[str], None]] = None,
+                   should_cancel=None) -> list:
     """拉取近 ``limit`` 个 release（新 → 旧）。
 
     策略：GitHub API 列表（1 次请求）→ releases 页面 HTML 抓取兜底。
@@ -193,7 +194,8 @@ def fetch_releases(limit: int = RELEASE_LIMIT,
     def _api_status(proxy_label, idx, total):
         _emit(f"通过 {proxy_label} · API")
 
-    data = download.fetch_json_api_smart(XXMI_API_LIST_URL, status_cb=_api_status)
+    data = download.fetch_json_api_smart(XXMI_API_LIST_URL, status_cb=_api_status,
+                                          should_cancel=should_cancel)
     if isinstance(data, list) and data:
         entries = []
         for rel in data:
@@ -216,7 +218,8 @@ def fetch_releases(limit: int = RELEASE_LIMIT,
     def _page_status(proxy_label, idx, total):
         _emit(f"通过 {proxy_label} · releases")
 
-    html = download.fetch_url_smart(XXMI_RELEASES_PAGE_URL, status_cb=_page_status)
+    html = download.fetch_url_smart(XXMI_RELEASES_PAGE_URL, status_cb=_page_status,
+                                    should_cancel=should_cancel)
     if not html:
         return []
 
@@ -984,6 +987,7 @@ class FetchReleasesThread(_CancelThread):
             entries = fetch_releases(
                 limit=self._limit,
                 status_cb=lambda text: self._emit_status(text),
+                should_cancel=self.is_cancelled,
             )
         except Exception as e:
             logger.error("拉取源码版本失败: %s", e, exc_info=True)

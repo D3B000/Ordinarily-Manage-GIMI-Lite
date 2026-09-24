@@ -67,7 +67,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import time
 from typing import Optional
 
 from PySide6.QtCore import Qt, QPoint, QSize, QRect, QThread, Signal
@@ -162,10 +161,6 @@ _ENV_COLOR_NOT_READY = "#FF9F0A"
 _ENV_COLOR_PENDING = TEXT_SECONDARY
 # 悬浮清单的兜底文案（检测尚未出结果时）
 _TIP_ENV_PENDING = "构建环境：正在检测…"
-
-# 关闭窗口时等待后台线程退出的最长时间（秒）。超时后若仍有不可中断的任务
-# （构建 / 仪式）在跑，则隐藏窗口、等其结束后自动关闭，而不是强行析构线程。
-_CLOSE_WAIT_SEC = 3.0
 
 
 class ArrowComboBox(QComboBox):
@@ -591,6 +586,7 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._copy_thread = None
         self._env_thread = None         # 构建环境检测（可重入，防重入见 _start_thread）
         self._clean_thread = None        # 清理线程
+        self._scan_thread = None         # 清理页：扫描可清理项线程
 
         # 分页状态：主分页（构建）为默认页，进入时总是回到主分页（不记忆退出页）
         self._current_page = "main"
@@ -605,6 +601,7 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._ritual_sig = alchemy.TaskSignals()
         self._copy_sig = alchemy.TaskSignals()
         self._env_sig = alchemy.TaskSignals()
+        self._scan_sig = alchemy.TaskSignals()
 
         self._build_content(self._main_page, content_layout)
 
@@ -1501,7 +1498,7 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
             self._bottom_bar.setVisible(False)
         else:
             self._title_label.setText("清理")
-            self._refresh_cleanup_page()
+            self._load_cleanup_page()
             self._main_page.setVisible(False)
             self._cleanup_page.setVisible(True)
             self._btn_clean.setVisible(False)
@@ -1544,7 +1541,8 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
     # ------------------------------------------------------------------
     # 清理：扫描 / 渲染 / 选择
     # ------------------------------------------------------------------
-    def _scan_cleanup_items(self) -> "dict":
+    @staticmethod
+    def _scan_cleanup_items() -> "dict":
         """扫描 alchemy 各子目录，返回 {key: (标题, 提示, [(名称, 路径, 字节数), ...])}。"""
         groups: dict = {}
 
@@ -1607,8 +1605,56 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
                 if sub is not None:
                     QuickBuildWindow._clear_layout(sub)
 
+    def _load_cleanup_page(self) -> None:
+        """进入 / 刷新清理页：先立刻显示页面（含加载占位），再后台扫描可清理项。
+
+        扫描 ``_scan_cleanup_items`` 需遍历 alchemy 各子目录并递归统计体积，对大
+        源码工程可能耗时数百毫秒 ~ 数秒；若在主线程同步执行会卡住「切换页面」本身。
+        因此这里**先渲染占位**（进度圈 + 文案），扫描交给 :class:`_ScanCleanupThread`，
+        结束回调 :meth:`_populate_cleanup_page` 再填充真实内容。用户点击「清理」后
+        立即看到页面、无需等待。
+        """
+        layout = self._cleanup_layout
+        self._clear_layout(layout)
+        self._group_select_btns: dict = {}
+        self._group_paths: dict = {}
+        self._cleanup_rows_by_path: dict = {}
+        self._path_category = {}
+        self._path_size = {}
+        # 每次（重新）扫描前清空选择：避免勾选指向已被删除 / 已变更的路径
+        self._selected = {}
+
+        # 先显示加载占位：进度圈（indeterminate）+ 文案，居中一行
+        busy = QWidget(self._cleanup_page)
+        blay = QHBoxLayout(busy)
+        blay.setContentsMargins(0, 0, 0, 0)
+        blay.setSpacing(8)
+        ring = DownloadProgressRing(busy, size=18, thickness=2, cancellable=False)
+        ring.setDark(True)
+        ring.setAccentColor(ACCENT)
+        ring.set_indeterminate(True)
+        blay.addWidget(ring)
+        tip_lbl = QLabel("正在扫描可清理文件…", busy)
+        tip_lbl.setObjectName("TitleHint")
+        blay.addWidget(tip_lbl)
+        blay.addStretch(1)
+        layout.addWidget(busy)
+        layout.addStretch(1)
+
+        # 防重入：已有扫描在跑则不重复起（旧线程结束会自动填充最新结果）
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            return
+        thread = _ScanCleanupThread(self._scan_sig)
+        thread.result.connect(self._populate_cleanup_page)
+        self._start_thread("_scan_thread", thread)
+
     def _refresh_cleanup_page(self) -> None:
-        """重建清理分页：按目录分组，组内逐项勾选 + 全选按钮 + 大小。"""
+        """兼容别名：等同于「重新异步加载清理页」。保留以防其它调用点遗漏。"""
+        self._load_cleanup_page()
+
+    def _populate_cleanup_page(self, data: "dict") -> None:
+        """用后台扫描得到的 ``data`` 重建清理分页：按目录分组，组内逐项勾选 +
+        全选按钮 + 大小。"""
         layout = self._cleanup_layout
         self._clear_layout(layout)
         self._group_select_btns: dict = {}
@@ -1617,7 +1663,7 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._path_category = {}
         self._path_size = {}
 
-        data = self._scan_cleanup_items()
+        # data 由后台线程传入；这里不再重新扫描
 
         # 裁剪失效选择（已不存在的路径）
         current_paths = set()
@@ -1758,24 +1804,29 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._notify(self._btn_clean_action, msg, is_error=not ok)
         if ok:
             self._selected.clear()
-            self._refresh_cleanup_page()
+            self._load_cleanup_page()
 
     def _running_threads(self) -> list:
         """当前仍在运行的任务线程列表。"""
         threads = (self._fetch_thread, self._dl_thread, self._pdl_thread,
                    self._build_thread, self._ritual_thread, self._copy_thread,
-                   self._env_thread, self._clean_thread)
+                   self._env_thread, self._clean_thread, self._scan_thread)
         return [t for t in threads if t is not None and t.isRunning()]
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        """关闭前先停止可取消的线程，并等待不可中断的任务收尾。
+        """关闭前请求取消后台任务，但**不阻塞等待**——立即隐藏窗口，用户感知为
+        瞬间关闭。
 
-        直接销毁窗口会让仍在运行的 QThread 随窗口一同析构，Qt 会 abort
-        （"Destroyed while thread is still running"，表现为闪退）。处理顺序：
-          1. 可取消的线程（拉取 / 下载 / 复制）先 request_cancel；
-          2. 限时等待它们退出（:data:`_CLOSE_WAIT_SEC`）；
-          3. 若仍有不可中断的任务（构建 / 仪式）在跑，则先隐藏窗口并忽略
-             本次关闭，等它们结束后由 :meth:`_close_when_idle` 真正关闭。
+        各任务线程均为独立 ``QObject``（parent=None），窗口隐藏 / 复用并不会析构
+        仍在运行的线程，因此无需 ``t.wait()``，也就不会出现「点关闭后卡 3 秒」的
+        问题。关闭后：
+          * 可取消任务（拉取 / 下载 / 复制 / 扫描 / 清理）会尽快收尾（fetch 现已
+            支持 ``should_cancel``，``request_cancel`` 可真正中断在途网络请求）；
+          * 不可中断任务（构建 / 仪式，底层 msbuild 进程）继续在后台跑，其结束时
+            的结果回调会写回（已隐藏的）窗口，下次 ``show`` 即是最新状态。
+
+        线程对象由 :meth:`_start_thread` 注册的 ``finished -> deleteLater`` 在任务
+        真正结束后自动回收，无需在此等待。
         """
         running = self._running_threads()
         if not running:
@@ -1787,28 +1838,9 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
                 t.request_cancel()
             except Exception:
                 pass
-
-        deadline = time.time() + _CLOSE_WAIT_SEC
-        for t in running:
-            remaining = int(max(0.0, deadline - time.time()) * 1000)
-            if remaining > 0:
-                t.wait(remaining)
-
-        still = self._running_threads()
-        if still:
-            event.ignore()
-            self.hide()
-            logger.info("便捷构建: 仍有 %d 个任务在运行，窗口已隐藏，结束后自动关闭",
-                        len(still))
-            for t in still:
-                t.finished.connect(self._close_when_idle)
-            return
+        # 立即隐藏并接受关闭（close() 默认隐藏窗口、不销毁）。不阻塞 UI 线程。
+        self.hide()
         super().closeEvent(event)
-
-    def _close_when_idle(self) -> None:
-        """所有后台任务结束后真正关闭窗口（延迟关闭的收尾）。"""
-        if not self._running_threads():
-            self.close()
 
     # ------------------------------------------------------------------
     # 拖拽
@@ -1868,6 +1900,23 @@ class _CleanupThread(QThread):
         except Exception as e:  # 兜底：任何异常都转为失败信号，绝不逃出线程
             logger.error("清理失败: %s", e, exc_info=True)
             self.finished.emit(False, f"清理失败: {e}")
+
+
+class _ScanCleanupThread(alchemy._CancelThread):
+    """清理页扫描线程：在后台递归统计 alchemy 各子目录体积，结果回传 UI。"""
+
+    result = Signal(object)           # dict: {key: (标题, 提示, [(名称, 路径, 字节数), ...])}
+
+    def __init__(self, signals: "TaskSignals", parent=None):
+        super().__init__(signals, parent)
+
+    def _run_impl(self):
+        try:
+            data = QuickBuildWindow._scan_cleanup_items()
+        except Exception as e:
+            logger.error("扫描可清理项失败: %s", e, exc_info=True)
+            data = {}
+        self.result.emit(data)
 
 
 class _ConfirmCleanupDialog(QDialog):

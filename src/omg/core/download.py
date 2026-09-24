@@ -691,7 +691,8 @@ def _extract_proxy_label(candidate_url: str, original_url: str) -> str:
 def fetch_url_smart(url: str, timeout: int = 15,
                     use_proxies: bool = True,
                     status_cb=None,
-                    headers: Optional[dict] = None) -> Optional[str]:
+                    headers: Optional[dict] = None,
+                    should_cancel=None) -> Optional[str]:
     """获取 URL 内容,返回解码文本。支持多代理 failover + SSL 回退
 
     替代 main.py 中的 _fetch_url 函数。
@@ -730,6 +731,9 @@ def fetch_url_smart(url: str, timeout: int = 15,
                 status_cb(label, i, total)
             except Exception:
                 pass
+        if should_cancel and should_cancel():
+            logger.info("fetch_url_smart 已被取消，提前返回")
+            return None
         for chan_name, opener in openers:
             try:
                 req = urllib.request.Request(candidate_url, headers=browser_headers)
@@ -744,7 +748,8 @@ def fetch_url_smart(url: str, timeout: int = 15,
 
 def fetch_json_api_smart(url: str, timeout: int = 15,
                         use_proxies: bool = True,
-                        status_cb=None) -> Optional[dict]:
+                        status_cb=None,
+                        should_cancel=None) -> Optional[dict]:
     """获取 JSON API。支持多代理 failover + SSL 回退
 
     替代 main.py 中的 _fetch_json_api 函数。
@@ -779,6 +784,9 @@ def fetch_json_api_smart(url: str, timeout: int = 15,
                 status_cb(label, i, total)
             except Exception:
                 pass
+        if should_cancel and should_cancel():
+            logger.info("fetch_json_api_smart 已被取消，提前返回")
+            return None
         for chan_name, opener in openers:
             try:
                 req = urllib.request.Request(candidate_url, headers=headers)
