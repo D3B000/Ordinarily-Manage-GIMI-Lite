@@ -1,27 +1,32 @@
 """
 omg.ui.OMGCmdOutput — OMG 风格「命令输出」侧页。
 
-给耗时操作（如「写回差分值」）一个**贴着主窗口侧面**的实时输出页：
+给耗时操作（如「写回差分值」「构建」「文件优化」）一个**贴着主窗口侧面**的
+实时输出页：
 
+* 尺寸：固定 320×360（透明顶层窗四周留 ``MARGIN`` 阴影留白）；
 * 位置：优先贴在锚点窗口**右侧**；右侧放不下则退到**左侧**；与锚点之间留
   ``GAP`` 的细微间隔，整体再按屏幕可用区夹取，保证完整可见；
-* 内容：等宽字体只读文本域，逐行追加（``append``），自动滚到底部；
-* 生命周期：运行期间常驻，结束后由调用方延时自动关闭，最终结果 / 错误由调用方
-  记入 log（本组件只负责「显示」，不碰日志与业务）；
+* 标题：固定 ``>_``（终端提示符意象），标题栏的关闭按钮与其它页面同款
+  （``genshin_function_control_close.svg`` + ``TitleBtn`` 样式）；
+* 内容：等宽字体只读文本域，逐行追加（``append``），**仅垂直滚动条**，
+  水平方向按控件宽度自动换行（``WidgetWidth``）；
+* 关闭逻辑：运行结束调用 :meth:`finish` —— **成功则延时自动关闭**，
+  **失败 / 异常则保留页面**，方便用户查看报错；用户也可随时点关闭按钮手动收起；
 * 置顶：锚点窗口置顶时可用 ``set_topmost(True)`` 同步（Win32 ``SetWindowPos``，
   不重建原生窗口，因此不闪烁）。
 
 用法::
 
     panel = OMGCmdOutput(theme="dark")
-    panel.reset("写回差分值")
-    panel.place_beside(self)        # 贴到主窗口右侧（放不下则左侧）
+    panel.reset("构建")            # 清空并（可选）写窗口标题
+    panel.place_beside(self)       # 贴到主窗口右侧（放不下则左侧）
     panel.set_topmost(self._pinned)
     panel.show()
     panel.append("扫描到 12 个 .ini")
     ...
-    panel.mark_done(True)
-    QTimer.singleShot(1500, panel.hide)
+    panel.finish(True)             # 成功 → 延时自动关闭
+    panel.finish(False)            # 失败 / 异常 → 保留页面
 
 设计取舍：与 ``OMGPopCard`` 同一套「透明顶层窗 + 实体子容器」结构——阴影加在
 子容器上（直接加在透明顶层窗会让 Windows 的 ``UpdateLayeredWindowIndirect``
@@ -35,7 +40,7 @@ import ctypes
 import sys
 from typing import Optional
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,6 +54,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from omg.ui.icon_loader import tinted_icon
 from omg.ui.window_flags import window_flags
 
 # ---------------------------------------------------------------------------
@@ -66,6 +72,8 @@ _TOKENS = {
         "accent": "#0A84FF",
         "ok": "#639922",
         "error": "#E0554E",
+        "hover": "#38383B",
+        "pressed": "#444448",
         "shadow": QColor(0, 0, 0, 150),
     },
     "light": {
@@ -79,30 +87,42 @@ _TOKENS = {
         "accent": "#0A84FF",
         "ok": "#4A8B1F",
         "error": "#C0392B",
+        "hover": "rgba(0,0,0,0.06)",
+        "pressed": "rgba(0,0,0,0.10)",
         "shadow": QColor(0, 0, 0, 60),
     },
 }
 
 FONT_FAMILY = "Microsoft YaHei UI"
 MONO_FAMILY = "Consolas"
-FONT_SIZE_TITLE = 13
+FONT_SIZE_TITLE = 13          # ">_" 使用等宽字体，终端提示符意象（与其它页面 TitleText 同字号）
 FONT_SIZE_CONSOLE = 12
 
-PANEL_W = 320          # 可视宽度（不含阴影留白）
-PANEL_MIN_W = 240
+PANEL_W = 320          # 固定可视宽度（不含阴影留白）
+PANEL_H = 360          # 固定可视高度（不含阴影留白）
+PANEL_MIN_W = 240      # 仅当屏幕可用宽度不足时作为下限夹取
 PANEL_MIN_H = 160
 GAP = 8                # 与锚点窗口之间的细微间隔
 EDGE_PAD = 6           # 距屏幕可用区边缘的最小留白
 
 RADIUS = 8             # 面板圆角
-PAD_X = 12             # 标题区左右内边距
-PAD_Y = 8              # 标题区上下内边距
 SHADOW_BLUR = 18
 SHADOW_OFFSET_Y = 3
 # 顶层窗透明留白必须装得下整片阴影（同 OMGPopCard，否则 layered 窗口刷新失败）
 MARGIN = SHADOW_BLUR + abs(SHADOW_OFFSET_Y) + 4
 
 MAX_LINES = 2000       # 输出行数上限（超出丢弃最旧的，防长任务吃内存）
+
+# 成功完成后自动关闭的延时（毫秒）
+CLOSE_DELAY = 1500
+
+# 同款关闭按钮（与其它页面一致）
+CLOSE_ICON = "genshin_function_control_close.svg"
+CLOSE_ICON_SIZE = 16
+TEXT_PRIMARY = "#F5F5F7"      # 深色主题前景色（关闭图标着色用）
+
+# 固定标题（终端提示符意象）
+TITLE_TEXT = ">_"
 
 
 def _tokens(theme: str) -> dict:
@@ -114,7 +134,7 @@ class OMGCmdOutput(QWidget):
 
     Args:
         theme: ``"dark"``（默认）/ ``"light"``。
-        title: 标题栏文案，可用 :meth:`reset` 每次运行前改写。
+        title: 窗口标题（任务栏 / 无障碍用），标题栏文字固定为 ``>_``。
     """
 
     def __init__(self, parent=None, theme: str = "dark",
@@ -129,6 +149,7 @@ class OMGCmdOutput(QWidget):
 
         self._theme = theme if theme in _TOKENS else "dark"
         self._topmost = False
+        self._auto_close_timer: Optional[QTimer] = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(MARGIN, MARGIN, MARGIN, MARGIN)
@@ -141,21 +162,27 @@ class OMGCmdOutput(QWidget):
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
 
-        head = QWidget(self._surface)
+        head = QFrame(self._surface)
+        head.setObjectName("TitleBar")
+        head.setFixedHeight(32)        # 与其它 OMG 页面标题栏同高
         hl = QHBoxLayout(head)
-        hl.setContentsMargins(PAD_X, PAD_Y, PAD_X - 4, PAD_Y)
-        hl.setSpacing(8)
-        self._title = QLabel(title, head)
-        self._title.setObjectName("OMGCmdOutputTitle")
+        hl.setContentsMargins(12, 0, 8, 0)
+        hl.setSpacing(4)
+        self._title = QLabel(TITLE_TEXT, head)
+        self._title.setObjectName("TitleText")   # 与其它页面同款标题样式
         hl.addWidget(self._title)
         self._hint = QLabel("", head)      # 运行态提示：运行中… / 完成 / 失败
         self._hint.setObjectName("OMGCmdOutputHint")
         hl.addWidget(self._hint)
         hl.addStretch(1)
-        self._btn_close = QPushButton("×", head)
-        self._btn_close.setObjectName("OMGCmdOutputClose")
-        self._btn_close.setFixedSize(18, 18)
+        # 同款关闭按钮（与其它页面一致：TitleBtn + 主题前景色线稿图标）
+        self._btn_close = QPushButton(head)
+        self._btn_close.setObjectName("TitleBtn")
+        self._btn_close.setFixedSize(24, 24)
         self._btn_close.setCursor(Qt.PointingHandCursor)
+        self._btn_close.setIcon(
+            tinted_icon(CLOSE_ICON, CLOSE_ICON_SIZE, TEXT_PRIMARY))
+        self._btn_close.setIconSize(QSize(CLOSE_ICON_SIZE, CLOSE_ICON_SIZE))
         self._btn_close.clicked.connect(self.hide)
         hl.addWidget(self._btn_close)
         sl.addWidget(head)
@@ -168,10 +195,11 @@ class OMGCmdOutput(QWidget):
         self._view = QPlainTextEdit(self._surface)
         self._view.setObjectName("OMGCmdOutputView")
         self._view.setReadOnly(True)
-        self._view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self._view.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 重新设计：水平按控件宽度自动换行，只保留垂直滚动条
+        self._view.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._view.setTextInteractionFlags(Qt.TextSelectableByMouse)
         font = QFont(MONO_FAMILY)
         font.setPixelSize(FONT_SIZE_CONSOLE)
         self._view.setFont(font)
@@ -186,7 +214,7 @@ class OMGCmdOutput(QWidget):
 
         root.addWidget(self._surface)
         self._apply_theme()
-        self.setFixedSize(PANEL_W + 2 * MARGIN, PANEL_MIN_H + 2 * MARGIN)
+        self.setFixedSize(PANEL_W + 2 * MARGIN, PANEL_H + 2 * MARGIN)
 
     # ------------------------------------------------------------------
     # 外观
@@ -199,7 +227,7 @@ class OMGCmdOutput(QWidget):
             f"border:1px solid {t['border']};border-radius:{RADIUS}px;}}"
             f"#OMGCmdOutputSep{{background:{t['divider']};border:none;}}")
         self._title.setStyleSheet(
-            f"color:{t['title']};font-family:'{FONT_FAMILY}';"
+            f"color:{t['title']};font-family:'{MONO_FAMILY}';"
             f"font-size:{FONT_SIZE_TITLE}px;font-weight:600;")
         self._view.setStyleSheet(
             f"QPlainTextEdit#OMGCmdOutputView{{background:{t['console_bg']};"
@@ -212,27 +240,25 @@ class OMGCmdOutput(QWidget):
             f"QScrollBar::handle:vertical{{background:{t['border']};"
             f"border-radius:4px;min-height:24px;}}"
             f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical"
-            f"{{height:0;}}"
-            f"QScrollBar:horizontal{{background:transparent;height:8px;"
-            f"margin:2px;}}"
-            f"QScrollBar::handle:horizontal{{background:{t['border']};"
-            f"border-radius:4px;min-width:24px;}}"
-            f"QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal"
-            f"{{width:0;}}")
+            f"{{height:0;}}")
         self._btn_close.setStyleSheet(
-            f"QPushButton#OMGCmdOutputClose{{color:{t['text_secondary']};"
-            f"background:transparent;border:none;font-size:14px;}}"
-            f"QPushButton#OMGCmdOutputClose:hover{{color:{t['text']};}}")
+            f"QPushButton#TitleBtn{{background:transparent;border:none;"
+            f"padding:0;border-radius:4px;}}"
+            f"QPushButton#TitleBtn:hover{{background:{t['hover']};}}"
+            f"QPushButton#TitleBtn:pressed{{background:{t['pressed']};}}")
         self._shadow.setColor(t["shadow"])
 
     # ------------------------------------------------------------------
     # 内容
     # ------------------------------------------------------------------
     def reset(self, title: Optional[str] = None) -> None:
-        """清空输出并（可选）改写标题，标记本次运行开始。"""
+        """清空输出并（可选）改写窗口标题，标记本次运行开始。
+
+        同时取消任何待执行的自动关闭（新一轮运行不应被上一轮的延时关闭打断）。
+        """
+        self.cancel_auto_close()
         if title:
             self.setWindowTitle(title)
-            self._title.setText(title)
         self._view.clear()
         self.set_hint("运行中…")
 
@@ -249,7 +275,22 @@ class OMGCmdOutput(QWidget):
             f"color:{color};font-family:'{FONT_FAMILY}';font-size:12px;")
 
     def mark_done(self, ok: bool) -> None:
+        """仅更新标题栏右侧的状态提示（完成 / 失败），不触发关闭。"""
         self.set_hint("完成" if ok else "失败", ok)
+
+    def finish(self, ok: bool) -> None:
+        """标记结束并按结果决定去留。
+
+        * 成功 → 延时 :data:`CLOSE_DELAY` 后自动关闭；
+        * 失败 / 异常 → 保留页面，方便用户查看报错。
+
+        调用方在耗时任务真正结束时调用（如 ``finished`` 信号回调）。
+        """
+        self.mark_done(ok)
+        if ok:
+            self._schedule_auto_close()
+        else:
+            self.cancel_auto_close()
 
     def append(self, line: str) -> None:
         """追加一行输出（可安全地从工作线程经信号调用）。"""
@@ -265,20 +306,47 @@ class OMGCmdOutput(QWidget):
         return self._view.toPlainText()
 
     # ------------------------------------------------------------------
+    # 自动关闭
+    # ------------------------------------------------------------------
+    def cancel_auto_close(self) -> None:
+        """取消任何待执行的自动关闭定时器。"""
+        if self._auto_close_timer is not None:
+            self._auto_close_timer.stop()
+            self._auto_close_timer.deleteLater()
+            self._auto_close_timer = None
+
+    def _schedule_auto_close(self, delay: int = CLOSE_DELAY) -> None:
+        """（成功时）安排一次延时自动关闭；重复调用会刷新计时。"""
+        self.cancel_auto_close()
+        self._auto_close_timer = QTimer(self)
+        self._auto_close_timer.setSingleShot(True)
+        self._auto_close_timer.timeout.connect(self.hide)
+        self._auto_close_timer.start(delay)
+
+    def keep_open(self) -> None:
+        """显式保持页面打开（取消待执行的自动关闭）。"""
+        self.cancel_auto_close()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        # 任何路径的收起都取消挂着的自动关闭，避免「关了又弹」或野定时器
+        self.cancel_auto_close()
+        super().hideEvent(event)
+
+    # ------------------------------------------------------------------
     # 定位 / 置顶
     # ------------------------------------------------------------------
     def place_beside(self, anchor: QWidget, prefer_right: bool = True) -> str:
         """贴到锚点窗口侧面：右侧优先，放不下则左侧；返回实际落在哪一侧。
 
-        高度跟随锚点（并按屏幕可用区夹取），与锚点之间留 ``GAP``。
+        尺寸固定为 :data:`PANEL_W` × :data:`PANEL_H`，并按屏幕可用区夹取，
+        保证完整可见。
         """
         ag = anchor.frameGeometry()
         screen = QApplication.screenAt(ag.center()) or QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else ag
 
         w = max(PANEL_MIN_W, min(PANEL_W, avail.width() - 2 * EDGE_PAD))
-        h = max(PANEL_MIN_H,
-                min(ag.height(), avail.height() - 2 * EDGE_PAD))
+        h = max(PANEL_MIN_H, min(PANEL_H, avail.height() - 2 * EDGE_PAD))
         self.setFixedSize(w + 2 * MARGIN, h + 2 * MARGIN)
 
         right_x = ag.right() + 1 + GAP

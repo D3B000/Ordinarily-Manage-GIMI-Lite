@@ -55,7 +55,7 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QWidget,
-    QSizePolicy, QProxyStyle, QStyle,
+    QSizePolicy,
 )
 
 from omg.domain.launch.controller import LaunchController
@@ -77,6 +77,12 @@ from omg.core.window_behavior import (
 from omg.ui.global_hotkey import MOD_ALT, VK_OEM_3, GlobalHotkey
 from omg.ui.idle_fade import IdleFadeController
 from omg.ui.OMGPopCard import install_pop_cards
+# 菜单留白节奏 / 项高口径（托盘右键菜单共用同一套）。这里转发为模块级名字，
+# 保持本模块既有名字可用（回归脚本从 omg.pages.home import MENU_ICON_COL）。
+from omg.ui.menu_style import (
+    MENU_GUTTER, MENU_ICON_COL, MENU_ICON_SIZE, MENU_ITEM_CONTENT_H,
+    ICON_MENU_ID, menu_icon as _menu_icon, menu_icon_style, new_icon_menu,
+)
 from omg.ui.window_flags import window_flags  # 顶层 flags 单一真源
 from omg.ui.window_geo import CenteredPopupMixin  # 几何记忆：首次居中 / 之后按上次位置
 from omg.widgets.progress_ring import DownloadProgressRing
@@ -159,26 +165,6 @@ STATE_UP_TO_DATE = "up_to_date"
 STATE_AVAILABLE = "available"
 STATE_UPDATING = "updating"
 STATE_ERROR = "error"
-
-# 菜单项留白节奏（四段等距，单位 px，均为 MENU_GUTTER）：
-#   边框 → 高亮块左端（QMenu padding-left）
-#   → 图标字形（图标自带透明左内边距 MENU_GUTTER，见 _menu_icon）
-#   → 文本（item padding-left 3 + 样式固定 7）
-# 为什么留空要做进图标：QMenu 的动作布局矩形同时决定图标列与高亮块的绘制
-# 范围，两者左缘恒齐平；QSS 的 padding / margin（含负值）都无法让块比图标
-# 更靠左或用留空错开（实测：margin 连内容一起平移，或插进图标中间）。
-# 把 MENU_GUTTER 的透明内边距画进图标，就等于在「块内」把字形右推 10px，
-# 于是块左端 → 字形 = 字形 → 文本 = 边框 → 块 = 10px。
-MENU_GUTTER = 10
-MENU_ICON_SIZE = 14             # 菜单图标字形尺寸
-MENU_ICON_COL = MENU_ICON_SIZE + MENU_GUTTER   # 图标列宽（含左侧透明留空）
-# 项内容高度：图标只按 14px 自然高绘制，但 QMenu 为它预留 PM_SmallIconSize（方形
-# 24px）的盒子 → 带图标项内容高 24、无图标项只有文字高 17，一高一矮（36 vs 29）。
-# 这里固定为「文字行高 17」，让带图标菜单与全应用其它菜单的项高完全一致。
-# 必须 >= 文字行高（否则文字被裁）且 >= 图标高 14（否则图标被裁）；改 font-size
-# 时同步改它，回归脚本会校验墨迹没被裁掉。
-MENU_ITEM_CONTENT_H = 17
-
 
 # ===========================================================================
 # QSS 样式表
@@ -265,13 +251,13 @@ QMenu::item {{
     color: {TEXT_PRIMARY};
     font-size: 12px;
 }}
-/* 带图标的菜单（HomeIconMenu）：固定项内容高度。
+/* 用了统一图标口径的菜单（objectName = IconMenu，见 omg.ui.menu_style）：
    图标方块（PM_SmallIconSize = 图标列宽 24）只为 14px 的字形预留，会把带图标项
    的内容高度顶到 24 → 无图标项只有文字高 17，两项一高一矮（36 vs 29）。
    注意只能用 height、不能用 min-height：min-height 只能把内容抬高，压不下来
    （声明 24 时 height:17 会被 min 顶回 24，实测无效）。左右 padding 不动，
    故宽度节奏（四段等距留白）完全不受影响。 */
-QMenu#HomeIconMenu::item {{
+QMenu#{ICON_MENU_ID}::item {{
     height: {MENU_ITEM_CONTENT_H}px;
 }}
 QMenu::item:selected {{
@@ -283,37 +269,6 @@ QMenu::separator {{
     margin: 4px 8px;
 }}
 """
-
-# ===========================================================================
-# 菜单图标样式：防止图标被缩放
-# ===========================================================================
-class _MenuIconStyle(QProxyStyle):
-    """把菜单的 ``PM_SmallIconSize`` 提到 ``MENU_ICON_COL``，避免图标被缩小。
-
-    QMenu 按样式表的 SmallIconSize（默认 16）请求/绘制图标，宽 24 的
-    「字形 + 透明留空」图标会被等比缩小到 16×9——10px 留空被压缩成 6.7px，
-    字形高度也从 14 缩到 9，两者都破坏等距节奏。本样式只挂在菜单上
-    （进程共享、自持引用），不影响其它控件的图标尺寸。
-    """
-
-    def pixelMetric(self, metric, option, widget=None):  # type: ignore[override]
-        if metric == QStyle.PM_SmallIconSize and (
-                widget is None or isinstance(widget, QMenu)):
-            return MENU_ICON_COL
-        return super().pixelMetric(metric, option, widget)
-
-
-_MENU_ICON_STYLE_CACHE: dict = {}
-
-
-def menu_icon_style() -> "_MenuIconStyle":
-    """进程内共享的菜单图标样式（QMenu.setStyle 不接管所有权，需自持引用）。"""
-    st = _MENU_ICON_STYLE_CACHE.get("style")
-    if st is None:
-        st = _MenuIconStyle()
-        _MENU_ICON_STYLE_CACHE["style"] = st
-    return st
-
 
 # ===========================================================================
 # SVG 图标加载辅助
@@ -330,25 +285,6 @@ def _svg_icon(filename: str, px: int = 16, color: str = ICON_COLOR) -> QIcon:
     """
     from omg.ui.icon_loader import svg_icon
     return svg_icon("home/" + filename, px, color)
-
-
-def _menu_icon(filename: str) -> QIcon:
-    """菜单项图标：左侧带 ``MENU_GUTTER`` px 透明内边距。
-
-    QMenu 的图标列左端与高亮块左端恒齐平（QSS 无法错开，见 MENU_GUTTER 说明），
-    因此把「块内图标左侧留空」做进图标本身：字形右推 MENU_GUTTER，于是
-    「块左端 → 字形」= 「字形 → 文本」= 「边框 → 块」= MENU_GUTTER。
-
-    无图标项（如「隐藏面板」）仍按同一图标列宽对齐，文本与带图标项天然对齐。
-    """
-    glyph = _svg_icon(filename, MENU_ICON_SIZE)
-    src = glyph.pixmap(QSize(MENU_ICON_SIZE, MENU_ICON_SIZE))
-    pm = QPixmap(MENU_ICON_COL, MENU_ICON_SIZE)
-    pm.fill(Qt.transparent)
-    painter = QPainter(pm)
-    painter.drawPixmap(MENU_GUTTER, 0, src)
-    painter.end()
-    return QIcon(pm)
 
 
 def _make_version_font() -> "QFont":
@@ -923,9 +859,7 @@ class HomeWindow(CenteredPopupMixin, QWidget):
         self._btn_menu.setIcon(_svg_icon("menu.svg", 16))
         self._btn_menu.setIconSize(QSize(16, 16))
         self._btn_menu.setCursor(Qt.PointingHandCursor)
-        popup_menu = QMenu(self)
-        popup_menu.setObjectName("HomeIconMenu")  # 见 HOME_QSS：带图标菜单补项高下限
-        popup_menu.setStyle(menu_icon_style())
+        popup_menu = new_icon_menu(self)  # 统一口径：objectName + 防缩放图标样式
         self._menu_icon_style = menu_icon_style()  # QMenu.setStyle 不接管所有权，自持引用
         act_settings = popup_menu.addAction(_menu_icon("setting.svg"), "设置")
         popup_menu.addSeparator()
@@ -1635,9 +1569,7 @@ class HomeWindow(CenteredPopupMixin, QWidget):
         统一染成 ``ICON_COLOR``（白色）剪影，尺寸同为 14px。
         与菜单按钮（#2）保持一致，使用 setMenu 在点击时弹出。
         """
-        menu = QMenu(self)
-        menu.setObjectName("HomeIconMenu")  # 见 HOME_QSS：带图标菜单补项高下限
-        menu.setStyle(menu_icon_style())
+        menu = new_icon_menu(self)  # 统一口径：objectName + 防缩放图标样式
         self._tool_icon_style = menu_icon_style()  # QMenu.setStyle 不接管所有权，自持引用
         act_build = menu.addAction(_menu_icon("hammer.svg"), "便捷构建")
         act_build.triggered.connect(self._on_quick_build)

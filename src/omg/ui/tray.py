@@ -35,6 +35,9 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from omg.core.paths import ICONS_DIR
+# 菜单留白节奏 / 项高口径与首页面板菜单共用一套（new_icon_menu 已挂好
+# objectName 与防缩放图标样式；menu_icon(None) 给透明占位图标）。
+from omg.ui.menu_style import menu_icon, new_icon_menu
 
 __all__ = [
     "TRAY_ICON_PATH",
@@ -209,15 +212,18 @@ class TrayController(QObject):
         「复位面板」用于面板被拖出可视区（多显示器插拔 / 分辨率变化）后的兜底：
         把它移回屏幕中心并清空位置记忆，否则用户点了也看不到任何变化。
 
-        刻意不加图标：Windows 原生托盘菜单里塞图标既挤又破坏与其它托盘程序
-        的一致性，文字已经足够表达。
+        不显示图标（原生托盘菜单里塞图标既挤又与其它托盘程序不一致），但要与
+        面板菜单保持同一套留白节奏：每项挂一个**全透明**的占位图标
+        ``menu_icon(None)``，占住 24px 图标列 → 文本缩进、菜单宽度、项高与面板
+        菜单完全一致（否则无图标项文本会从 15px 起排，比面板菜单的 42px 明显
+        靠左，两个菜单看着像两套样式）。
         """
-        menu = QMenu()
-        menu.addAction("显示面板", self._show_panel)
-        menu.addAction("资源浏览", self._open_resources)
-        menu.addAction("复位面板", self._reset_panel)
+        menu = new_icon_menu()
+        menu.addAction(menu_icon(None), "显示面板", self._show_panel)
+        menu.addAction(menu_icon(None), "资源浏览", self._open_resources)
+        menu.addAction(menu_icon(None), "复位面板", self._reset_panel)
         menu.addSeparator()
-        menu.addAction("退出程序", self._quit)
+        menu.addAction(menu_icon(None), "退出程序", self._quit)
         return menu
 
     # ------------------------------------------------------------------

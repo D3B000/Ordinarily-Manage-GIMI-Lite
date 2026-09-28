@@ -2016,13 +2016,12 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._set_status(msg if ok else f"写回未执行：{msg}", hold=True)
         if self._cmd_out is not None:
             self._cmd_out.append(("完成：" if ok else "失败：") + str(msg))
-            self._cmd_out.mark_done(ok)
+            # 完成 → 延时自动关闭；失败 / 异常 → 保留页面查看报错
+            self._cmd_out.finish(ok)
         if ok:
             logger.info("写回差分值完成：%s", msg)
         else:
             logger.error("写回差分值失败：%s", msg)
-        # 留一小会儿让用户看到最后一行，再自动关闭输出页
-        QTimer.singleShot(CMD_OUT_CLOSE_DELAY, self._close_cmd_output)
 
     def _cmd_output(self) -> OMGCmdOutput:
         """懒创建「命令输出」侧页（窗口存活期间复用同一实例）。"""

@@ -92,6 +92,7 @@ from omg.core.logging_setup import logger
 from omg.widgets.progress_ring import DownloadProgressRing
 from omg.ui.window_flags import window_flags  # noqa: E402  顶层 flags 单一真源
 from omg.ui.window_geo import CenteredPopupMixin
+from omg.ui.OMGCmdOutput import OMGCmdOutput
 from omg.ui.OMGPopCard import install_pop_cards, show_transient_card
 
 
@@ -588,6 +589,9 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._clean_thread = None        # 清理线程
         self._scan_thread = None         # 清理页：扫描可清理项线程
 
+        # 「命令输出」侧页（构建 / 文件优化 实时输出，懒创建，见 _cmd_output）
+        self._cmd_out: Optional[OMGCmdOutput] = None
+
         # 分页状态：主分页（构建）为默认页，进入时总是回到主分页（不记忆退出页）
         self._current_page = "main"
         self._selected: dict = {}        # path -> 是否选中（清理）
@@ -651,10 +655,33 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._ritual_sig.status.connect(self._btn_ritual.set_status)
         self._ritual_sig.finished.connect(self._on_ritual_finished)
 
+        # 构建 / 文件优化的实时输出 → 「命令输出」侧页（仅追加文本）
+        self._build_sig.status.connect(
+            lambda text: self._cmd_output().append(text))
+        self._ritual_sig.status.connect(
+            lambda text: self._cmd_output().append(text))
+
         self._copy_sig.finished.connect(self._on_copy_finished)
 
         # 「优化构建」会改变检测项（开启后多一项「注入基线」），切换后重跑一次
         self._switch_optimize.toggled.connect(lambda _on: self._refresh_env())
+
+    # ------------------------------------------------------------------
+    # 命令输出侧页（构建 / 文件优化）
+    # ------------------------------------------------------------------
+    def _cmd_output(self) -> OMGCmdOutput:
+        """懒创建「命令输出」侧页（窗口存活期间复用同一实例）。"""
+        if self._cmd_out is None:
+            self._cmd_out = OMGCmdOutput(theme="dark")
+        return self._cmd_out
+
+    def _ensure_cmd_output_shown(self, title: str) -> None:
+        """清空并展示命令输出侧页（新一轮运行开始时调用）。"""
+        panel = self._cmd_output()
+        panel.reset(title)
+        panel.place_beside(self)
+        panel.show()
+        panel.raise_()
 
     # ------------------------------------------------------------------
     # 标题栏
@@ -1319,6 +1346,12 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         if self._build_thread is not None and self._build_thread.isRunning():
             return
 
+        # 唤起「命令输出」侧页并实时显示构建输出
+        self._ensure_cmd_output_shown("构建")
+        self._cmd_output().append(f"项目：{version}")
+        self._cmd_output().append(
+            f"优化构建：{'开启' if self._switch_optimize.on else '关闭'}")
+
         self._btn_build.set_busy(True)
         self._btn_build.set_status("准备构建…")
 
@@ -1333,6 +1366,10 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._btn_build.set_status("")
         self._notify(self._btn_build, msg, is_error=not ok)
         if not ok:
+            # 失败 / 异常：保留输出页，方便用户查看报错
+            if self._cmd_out is not None:
+                self._cmd_out.append("失败：" + str(msg))
+                self._cmd_out.finish(False)
             return
 
         # 构建产物已落入 artifact/ → 刷新仪式目标文件默认值
@@ -1341,7 +1378,16 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         # 「构建完成后执行神秘仪式」：开关开启且仪式本身也开启 → 自动接仪式；
         # 仪式开关关闭则直接跳过。
         if self._switch_auto_ritual.on and self._switch_ritual.on:
+            # 保持输出页打开，并在其上续接仪式输出（不自动关闭）
+            if self._cmd_out is not None:
+                self._cmd_out.keep_open()
+                self._cmd_out.append("\n── 自动执行神秘仪式 ──\n")
             self._start_ritual(auto=True)
+        else:
+            # 成功：延时自动关闭输出页
+            if self._cmd_out is not None:
+                self._cmd_out.append("完成：" + str(msg))
+                self._cmd_out.finish(True)
 
     # ------------------------------------------------------------------
     # 文件优化（神秘仪式）
@@ -1427,6 +1473,14 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         if self._ritual_thread is not None and self._ritual_thread.isRunning():
             return
 
+        # 唤起「命令输出」侧页：手动触发为新一轮（清空重开），自动接仪式则续接
+        if auto:
+            if self._cmd_out is not None:
+                self._cmd_out.append(f"仪式类型：{self._ritual_kind()}")
+        else:
+            self._ensure_cmd_output_shown("文件优化")
+            self._cmd_output().append(f"仪式类型：{self._ritual_kind()}")
+
         self._btn_ritual.set_busy(True)
         self._btn_ritual.set_status("正在执行仪式…")
 
@@ -1443,6 +1497,10 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._btn_ritual.set_busy(False)
         self._btn_ritual.set_status("")
         self._notify(self._btn_ritual, msg, is_error=not ok)
+        # 成功 → 延时自动关闭；失败 / 异常 → 保留页面查看报错
+        if self._cmd_out is not None:
+            self._cmd_out.append(("完成：" if ok else "失败：") + str(msg))
+            self._cmd_out.finish(ok)
 
     # ------------------------------------------------------------------
     # 自动化：复制到 GIMI
@@ -1840,6 +1898,9 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
                 pass
         # 立即隐藏并接受关闭（close() 默认隐藏窗口、不销毁）。不阻塞 UI 线程。
         self.hide()
+        # 命令输出侧页是本窗口的伴生窗口，随窗口一并收起（不让它留在屏幕上）
+        if self._cmd_out is not None and self._cmd_out.isVisible():
+            self._cmd_out.hide()
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
