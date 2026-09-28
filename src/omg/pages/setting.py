@@ -34,6 +34,7 @@ from omg.core.window_behavior import (
     DEFAULT_IDLE_OPACITY, MAX_IDLE_OPACITY, MIN_IDLE_OPACITY,
     DEFAULT_LAUNCH_HOLD_MS, MAX_LAUNCH_HOLD_MS, MIN_LAUNCH_HOLD_MS,
 )
+from omg.core.updates import is_dir_entry   # 白名单「目录条目」判定（纯函数）
 from omg.ui.window_flags import window_flags  # noqa: E402  顶层 flags 单一真源
 from omg.ui.window_geo import CenteredPopupMixin
 from omg.ui.OMGPopCard import install_pop_cards
@@ -104,8 +105,10 @@ CLOSE_ICON = "genshin_function_control_close.svg"
 CLOSE_ICON_SIZE = 16
 
 # 白名单增删按钮图标（位于 resources/icons/setting/，无 fill，按主题前景色着色以适配深色主题）
-ADD_ICON = "setting/add.svg"
+ADD_ICON = "setting/file-plus.svg"          # 添加文件（lucide 线稿，靠 currentColor 着色）
+ADD_DIR_ICON = "setting/folder-plus.svg"    # 添加文件夹
 DELETE_ICON = "setting/delete.svg"
+FOLDER_ICON = "setting/folder.svg"          # 列表里「目录」条目的标识（不带 +，与按钮区分）
 WHITELIST_ICON_SIZE = 16
 
 
@@ -1020,7 +1023,8 @@ class GimiPage(QWidget):
       - hunting_changed(int) / warning_changed(int)：分段控件选中变化；
       - autocheck_changed(bool)：更新检查开关变化；
       - whitelist_changed(list)：删除白名单项后抛出；
-      - add_file_requested()：点击「+」请求添加文件（由 domain 打开文件选择窗口）。
+      - add_file_requested()：点击「+」请求添加文件（由 domain 打开文件选择窗口）；
+      - add_folder_requested()：点击「文件夹」请求添加目录（由 domain 打开目录选择窗口）。
     具体行为（读写 config）由 domain 的 SettingsController 绑定实现。
     """
 
@@ -1029,6 +1033,7 @@ class GimiPage(QWidget):
     autocheck_changed = Signal(bool)
     whitelist_changed = Signal(list)   # 更新白名单变更（删后）
     add_file_requested = Signal()      # 点击「+」：请求添加白名单文件（由 domain 打开文件选择窗口）
+    add_folder_requested = Signal()    # 点击「文件夹」：请求添加白名单目录（由 domain 打开目录选择窗口）
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1126,13 +1131,25 @@ class GimiPage(QWidget):
         btn_add.clicked.connect(self.add_file_requested)
         col_btns.addWidget(btn_add)
 
+        # 「添加文件夹」：目录条目以分隔符结尾（如 Mods/），更新时该目录下
+        # 所有文件都不解压（含更新包新增的文件），见 core.updates.is_dir_entry
+        btn_add_dir = QPushButton(content)
+        btn_add_dir.setObjectName("IconBtn")
+        btn_add_dir.setFixedSize(28, 28)
+        btn_add_dir.setIcon(tinted_icon(ADD_DIR_ICON, WHITELIST_ICON_SIZE, TEXT_PRIMARY))
+        btn_add_dir.setIconSize(QSize(WHITELIST_ICON_SIZE, WHITELIST_ICON_SIZE))
+        btn_add_dir.setCursor(Qt.PointingHandCursor)
+        btn_add_dir.setToolTip("添加白名单文件夹（该文件夹内所有文件在更新时都不解压）")
+        btn_add_dir.clicked.connect(self.add_folder_requested)
+        col_btns.addWidget(btn_add_dir)
+
         btn_del = QPushButton(content)
         btn_del.setObjectName("IconBtn")
         btn_del.setFixedSize(28, 28)
         btn_del.setIcon(tinted_icon(DELETE_ICON, WHITELIST_ICON_SIZE, TEXT_PRIMARY))
         btn_del.setIconSize(QSize(WHITELIST_ICON_SIZE, WHITELIST_ICON_SIZE))
         btn_del.setCursor(Qt.PointingHandCursor)
-        btn_del.setToolTip("删除选中的白名单文件")
+        btn_del.setToolTip("删除选中的白名单条目")
         btn_del.clicked.connect(self._on_del_item)
         col_btns.addWidget(btn_del)
 
@@ -1201,11 +1218,20 @@ class GimiPage(QWidget):
         ]
 
     def set_whitelist(self, items) -> None:
-        """用给定列表回填白名单（绑定 / 启动时调用，不触发 whitelist_changed）。"""
+        """用给定列表回填白名单（绑定 / 启动时调用，不触发 whitelist_changed）。
+
+        以分隔符结尾的条目是**目录**（如 ``Mods/``），列表里给它加一个文件夹
+        图标，与文件条目区分开——否则单看文本（多一个斜杠）很容易被忽略。
+        """
         self._whitelist.clear()
         self._whitelist_sel_row = -1
         for it in (items or []):
-            self._whitelist.addItem(QListWidgetItem(str(it)))
+            text = str(it)
+            item = QListWidgetItem(text)
+            if is_dir_entry(text):
+                item.setIcon(tinted_icon(FOLDER_ICON, WHITELIST_ICON_SIZE,
+                                         TEXT_SECONDARY))
+            self._whitelist.addItem(item)
 
 
 # ===========================================================================

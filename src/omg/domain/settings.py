@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from omg.core.config import ConfigManager
 from omg.core.logging_setup import logger
+from omg.core.updates import is_dir_entry      # 白名单「目录条目」判定（纯函数）
 from omg.core.window_behavior import (
     DEFAULT_IDLE_OPACITY,
     KEY_OMG_ALWAYS_ON_TOP,
@@ -146,6 +147,7 @@ class SettingsController:
         gimi.autocheck_changed.connect(self._on_autocheck_changed)
         gimi.whitelist_changed.connect(self._on_whitelist_changed)
         gimi.add_file_requested.connect(lambda: self._add_whitelist_files(gimi))
+        gimi.add_folder_requested.connect(lambda: self._add_whitelist_folders(gimi))
 
         # ---- 启动页（启动方法 / 自定义启动 / 注入库）----
         startup = window.startup_page
@@ -309,7 +311,7 @@ class SettingsController:
             return
         wl = list(self.cfg.get(KEY_WHITELIST, []) or [])
         # 去重集合：已存条目统一视为「相对 GIMI 目录」的规范路径（兼容历史绝对路径）
-        wl_lower = {self._normalize_wl_entry(p, gimi_dir).lower() for p in wl}
+        wl_lower = {self._wl_key(p, gimi_dir) for p in wl}
         added = False
         for f in files:
             abs_path = os.path.normpath(os.path.abspath(f))
@@ -328,6 +330,60 @@ class SettingsController:
         if added:
             page.set_whitelist(wl)            # 刷新 UI 列表
             self._on_whitelist_changed(wl)    # 即时落盘
+
+    def _add_whitelist_folders(self, page) -> None:
+        """点击「文件夹」图标：把 GIMI 目录内的子目录加入更新白名单。
+
+        目录条目以分隔符结尾（如 ``Mods/``），语义覆盖该目录下的**所有文件**：
+        更新解压时整个目录都不解压，因此更新包里新增的文件也不会被写进同名
+        目录。这与单纯的「跳过覆盖」不同——后者挡不住新增文件，而新文件可能
+        与本地已改过的自定义内容混在一起（正是本功能的动机）。
+        """
+        gimi_dir = self.cfg.get(KEY_GIMI, "") or ""
+        if not gimi_dir or not os.path.isdir(gimi_dir):
+            QMessageBox.warning(
+                page, "未配置 GIMI 目录",
+                "请先在「路径」页设置 GIMI 目录，再添加更新白名单文件夹。",
+            )
+            return
+        folder = QFileDialog.getExistingDirectory(
+            page, "选择更新白名单文件夹", gimi_dir,
+        )
+        if not folder:
+            return
+        abs_path = os.path.normpath(os.path.abspath(folder))
+        if not self._is_path_inside(abs_path, gimi_dir):
+            QMessageBox.warning(
+                page, "文件夹不在 GIMI 目录内",
+                f"已跳过（白名单仅支持 GIMI 目录内的文件夹）：\n{abs_path}",
+            )
+            return
+        rel = self._normalize_wl_entry(abs_path, gimi_dir)
+        if rel in (".", "", "/"):
+            QMessageBox.warning(
+                page, "不能添加 GIMI 根目录",
+                "把 GIMI 根目录加入白名单会导致更新时跳过全部文件，已取消。",
+            )
+            return
+        wl = list(self.cfg.get(KEY_WHITELIST, []) or [])
+        entry = rel + "/"                       # 结尾分隔符 = 目录条目标记
+        if entry.lower() in {self._wl_key(p, gimi_dir) for p in wl}:
+            return                              # 已存在，无需重复添加
+        wl.append(entry)
+        page.set_whitelist(wl)                  # 刷新 UI 列表
+        self._on_whitelist_changed(wl)          # 即时落盘
+
+    @staticmethod
+    def _wl_key(entry: str, gimi_dir: str) -> str:
+        """白名单条目去重键：相对 GIMI 目录的规范路径（小写）。
+
+        目录条目必须保留结尾分隔符，否则 ``Mods/``（目录）与 ``Mods``（同名
+        文件）会被判成同一条目。
+        """
+        rel = SettingsController._normalize_wl_entry(entry, gimi_dir)
+        if is_dir_entry(entry):
+            rel = rel.rstrip("/") + "/"
+        return rel.lower()
 
     @staticmethod
     def _normalize_wl_entry(entry: str, gimi_dir: str) -> str:

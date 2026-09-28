@@ -213,6 +213,65 @@ class ExtractCancelled(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# 白名单跳过规则：文件 = 精确匹配；目录 = 前缀匹配（整个目录都不解压）
+# ---------------------------------------------------------------------------
+def is_dir_entry(entry: str) -> bool:
+    """白名单条目是否表示**目录**：以 ``/``（或 ``\\``）结尾。
+
+    目录条目的语义与文件条目不同：命中该目录下**全部**成员，更新时整个
+    目录都不解压——这样更新包里新增的文件也不会被写进同名目录。单纯的
+    「跳过覆盖」挡不住新增文件，而新文件可能与本地已有的自定义内容冲突
+    （例如本地改过的 ini 与新包附带的默认 ini 混在一起）。
+    """
+    return str(entry).replace("\\", "/").endswith("/")
+
+
+def _norm_rel(rel: str) -> str:
+    """规范相对路径（正斜杠、去前导斜杠）；目录条目的结尾分隔符要保留。"""
+    raw = str(rel).replace("\\", "/").lstrip("/")
+    norm = os.path.normpath(raw).replace("\\", "/").lstrip("/")
+    # normpath 会把 "Mods/" 折叠成 "Mods" —— 目录标记会丢，这里补回来
+    if raw.endswith("/") and not norm.endswith("/"):
+        norm += "/"
+    return norm
+
+
+def build_skip_rules(skip_files) -> tuple:
+    """把跳过列表拆成 ``(文件精确集合, 目录前缀元组)``，均已小写、正斜杠。
+
+    目录条目（以分隔符结尾）转成 ``"mods/"`` 形式的前缀，供
+    :func:`is_skipped` 做「其下所有成员」匹配；文件条目仍为精确匹配。
+    """
+    files = set()
+    dirs = []
+    for s in skip_files or ():
+        if not s:
+            continue
+        norm = _norm_rel(s).lower()
+        if not norm or norm == ".":
+            continue
+        if is_dir_entry(s):
+            dirs.append(norm if norm.endswith("/") else norm + "/")
+        else:
+            files.add(norm.rstrip("/"))
+    return files, tuple(dirs)
+
+
+def is_skipped(rel: str, rules) -> bool:
+    """zip 成员相对路径是否命中跳过规则（大小写不敏感）。
+
+    ``rules`` 为 :func:`build_skip_rules` 的返回值。
+    """
+    files, dirs = rules
+    low = _norm_rel(rel).lower()
+    if not low or low == ".":
+        return False
+    if low.rstrip("/") in files:
+        return True
+    return any(low.startswith(d) for d in dirs)
+
+
 def safe_extract_zip(zf, dest_dir: str, skip_files=None, should_cancel=None,
                     progress_cb=None) -> None:
     """解压 zip，带 Zip Slip 防护，并支持跳过白名单文件与取消。
@@ -220,9 +279,10 @@ def safe_extract_zip(zf, dest_dir: str, skip_files=None, should_cancel=None,
     Args:
         zf: 已打开的 ``zipfile.ZipFile`` 实例。
         dest_dir: 目标目录。
-        skip_files: 可选的相对路径集合（正斜杠），解压时跳过这些成员
-                    （大小写不敏感、路径已规范化后匹配）。对应「更新白名单」：
-                    这些文件在更新解压时不被覆盖，保留用户自定义内容。
+        skip_files: 可选的跳过列表（相对路径、正斜杠）。文件条目精确匹配；
+                    以分隔符结尾的**目录**条目匹配其下所有成员——整个目录
+                    都不解压（含更新包新增的文件），见 :func:`is_dir_entry`。
+                    对应「更新白名单」：这些路径在更新解压时不被覆盖。
         should_cancel: 可选无参可调用对象；返回 True 时立即抛出
                        :class:`ExtractCancelled`（用于用户中断更新解压）。
         progress_cb: 可选可调用 ``fraction(0~1)``；每解压完一个成员回调一次，
@@ -231,14 +291,7 @@ def safe_extract_zip(zf, dest_dir: str, skip_files=None, should_cancel=None,
     从 OMGDev/main.py._safe_extract_zip 原样移植，并增加取消钩子与进度回调。
     """
     dest_real = os.path.realpath(dest_dir)
-    skip_set = set()
-    if skip_files:
-        for s in skip_files:
-            if not s:
-                continue
-            # 规范化：反斜杠 → 正斜杠、去除前导斜杠、折叠重复分隔符、小写以便不区分大小写匹配
-            norm = os.path.normpath(s).replace("\\", "/").lstrip("/")
-            skip_set.add(norm.lower())
+    rules = build_skip_rules(skip_files)
 
     members = zf.namelist()
     total = len(members) or 1
@@ -248,8 +301,8 @@ def safe_extract_zip(zf, dest_dir: str, skip_files=None, should_cancel=None,
         target = os.path.realpath(os.path.join(dest_dir, member))
         if not target.startswith(dest_real + os.sep) and target != dest_real:
             raise ValueError(f"Zip Slip: 非法路径 {member!r}")
-        # 跳过白名单文件（大小写不敏感、路径规范化）
-        if member.lower() in skip_set:
+        # 跳过白名单（文件精确 / 目录前缀，大小写不敏感）
+        if is_skipped(member, rules):
             logger.info("白名单跳过: %s", member)
         else:
             zf.extract(member, dest_dir)
@@ -259,7 +312,7 @@ def safe_extract_zip(zf, dest_dir: str, skip_files=None, should_cancel=None,
 
 def _norm_member(member: str) -> str:
     """把 zip 成员名规范为相对 deploy_dir 的正斜杠路径（与 safe_extract_zip 一致）。"""
-    return os.path.normpath(member).replace("\\", "/").lstrip("/")
+    return _norm_rel(member)
 
 
 def _safe_remove(path: str) -> None:
@@ -278,12 +331,9 @@ def _prepare_rollback(zip_path: str, deploy_dir: str, skip_files) -> str | None:
     备份目录内写入 ``_members.txt`` 清单（zip 全部成员相对路径），供回退时
     删除「新增文件」（解压前不存在、被部分解压创建的文件）。
     """
-    skip_set = set()
-    if skip_files:
-        for s in skip_files:
-            if not s:
-                continue
-            skip_set.add(os.path.normpath(s).replace("\\", "/").lstrip("/").lower())
+    rules = build_skip_rules(skip_files)
+    backup_dir: str | None = None
+    keep = False
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             members = zf.namelist()
@@ -291,7 +341,7 @@ def _prepare_rollback(zip_path: str, deploy_dir: str, skip_files) -> str | None:
             backed_any = False
             for member in members:
                 rel = _norm_member(member)
-                if not rel or rel.lower() in skip_set:
+                if not rel or is_skipped(rel, rules):
                     continue
                 src = os.path.join(deploy_dir, member)
                 if not os.path.isfile(src):
@@ -302,20 +352,28 @@ def _prepare_rollback(zip_path: str, deploy_dir: str, skip_files) -> str | None:
                 backed_any = True
             with open(os.path.join(backup_dir, "_members.txt"), "w", encoding="utf-8") as mf:
                 mf.write("\n".join(members))
-            # 记录白名单成员，回退时绝不删除（它们本就不该被覆盖）
+            # 记录白名单规则，回退时绝不删除（它们本就不该被覆盖）
+            # 必须原样保留目录条目的结尾分隔符，否则目录前缀语义会丢失
             with open(os.path.join(backup_dir, "_skip.txt"), "w", encoding="utf-8") as sf:
-                sf.write("\n".join(sorted(skip_set)))
-            return backup_dir if backed_any else None
+                sf.write("\n".join(sorted(_norm_rel(s) for s in (skip_files or ()) if s)))
+            keep = backed_any
+            return backup_dir if keep else None
     except Exception as e:  # 备份失败不阻断更新，仅丢失回退能力
         logger.warning("准备回退备份失败（将跳过回退）: %s", e)
         return None
+    finally:
+        # mkdtemp 建的目录在「无需备份」或「备份中途失败」时既不会被返回、
+        # 也不会被后续清理路径看到 —— 必须就地删掉，否则每次成功更新都会
+        # 在系统临时目录里漏一个空目录。
+        if backup_dir is not None and not keep:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def _rollback(backup_dir: str | None, deploy_dir: str, zip_path: str) -> None:
     """回退到更新前状态：恢复备份文件、删除「新增文件」、删除临时 zip 与备份目录。"""
     try:
         members: set = set()
-        skip_members: set = set()
+        rules = build_skip_rules(None)      # 空规则（_skip.txt 缺失时的兜底）
         if backup_dir and os.path.isdir(backup_dir):
             mf = os.path.join(backup_dir, "_members.txt")
             if os.path.isfile(mf):
@@ -324,7 +382,9 @@ def _rollback(backup_dir: str | None, deploy_dir: str, zip_path: str) -> None:
             sf = os.path.join(backup_dir, "_skip.txt")
             if os.path.isfile(sf):
                 with open(sf, "r", encoding="utf-8") as f:
-                    skip_members = {m.strip().lower() for m in f.read().splitlines() if m.strip()}
+                    rules = build_skip_rules(
+                        [m.strip() for m in f.read().splitlines() if m.strip()]
+                    )
             # 1) 恢复备份的已存在文件
             for root, _dirs, files in os.walk(backup_dir):
                 files = [x for x in files if x not in ("_members.txt", "_skip.txt")]
@@ -336,8 +396,8 @@ def _rollback(backup_dir: str | None, deploy_dir: str, zip_path: str) -> None:
                     shutil.copy2(bk, tgt)
             # 2) 删除解压「新增」的文件（非白名单 zip 成员、更新前不存在、被部分解压创建）
             for member in members:
-                if member.lower() in skip_members:
-                    continue  # 白名单文件：从不删除
+                if is_skipped(member, rules):
+                    continue  # 白名单（含目录下的全部成员）：从不删除
                 tgt = os.path.join(deploy_dir, member)
                 if os.path.isfile(tgt) and not os.path.isfile(os.path.join(backup_dir, member)):
                     try:
@@ -359,6 +419,10 @@ def build_gimi_update_skip_files(deploy_dir: str, whitelist) -> list:
     逃逸 deploy_dir 的条目（归一化后不以 ``..`` 开头）。返回相对路径列表，
     供 :func:`safe_extract_zip` 做大小写不敏感匹配。
 
+    **目录条目**以分隔符结尾（如 ``Mods/``），语义是「该目录下所有文件在
+    更新时都不解压」（见 :func:`is_dir_entry`）；结尾分隔符必须在归一化后
+    补回，否则目录会被当成同名文件、丢失「整目录跳过」语义。
+
     从 OMGDev/main.py download_and_deploy_gimi 的白名单转换逻辑移植并改造。
     """
     skip = []
@@ -368,6 +432,8 @@ def build_gimi_update_skip_files(deploy_dir: str, whitelist) -> list:
     for entry in whitelist:
         if not entry:
             continue
+        # 目录标记要在归一化**之前**取：normpath / abspath 都会吃掉结尾分隔符
+        is_dir = is_dir_entry(entry)
         # 兼容历史绝对路径：统一换算为相对 deploy_dir 的规范路径
         if os.path.isabs(entry):
             try:
@@ -381,13 +447,19 @@ def build_gimi_update_skip_files(deploy_dir: str, whitelist) -> list:
         # 仅保留 deploy_dir 内部的路径（已逃逸则跳过）
         if rel.startswith(".."):
             continue
-        skip.append(rel.replace("\\", "/"))
+        rel = rel.replace("\\", "/")
+        if is_dir and not rel.endswith("/"):
+            rel += "/"
+        skip.append(rel)
     return skip
 
 
 def deploy_gimi_update(zip_path: str, deploy_dir: str, whitelist=None,
                        should_cancel=None, progress_cb=None) -> tuple:
-    """解压 GIMI 更新包到 deploy_dir，并跳过白名单中的文件（不覆盖）。
+    """解压 GIMI 更新包到 deploy_dir，并跳过白名单中的路径（不覆盖、不解压）。
+
+    白名单既可以是**文件**（精确匹配，该文件不被覆盖），也可以是**目录**
+    （以分隔符结尾，整个目录都不解压——更新包里新增的文件也不会写进去）。
 
     支持「用户取消」：解压前先备份将被覆盖的已存在文件，若解压过程中
     ``should_cancel`` 返回 True（或解压失败），则回退到更新前状态并删除临时

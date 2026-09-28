@@ -32,5 +32,8 @@
     <file>quick_build/xiala-down.svg</file>
     <file>setting/add.svg</file>
     <file>setting/delete.svg</file>
+    <file>setting/file-plus.svg</file>
+    <file>setting/folder.svg</file>
+    <file>setting/folder-plus.svg</file>
   </qresource>
 </RCC>
