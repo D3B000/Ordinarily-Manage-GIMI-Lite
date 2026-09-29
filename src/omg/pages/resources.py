@@ -42,7 +42,7 @@ from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QPoint, QSize, QUrl, QRect, QRectF, Signal, QTimer
 from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFontMetrics,
-                           QPainter, QPainterPath, QPen, QPixmap)
+                           QIcon, QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QGraphicsBlurEffect, QGridLayout,
     QHBoxLayout, QLabel,
@@ -66,6 +66,7 @@ from omg.core.alchemy import _CancelThread, TaskSignals
 from omg.core.logging_setup import logger
 from omg.ui.window_flags import window_flags  # noqa: E402  顶层 flags 单一真源
 from omg.ui.window_geo import CenteredPopupMixin
+from omg.widgets.progress_ring import DownloadProgressRing
 from omg.ui.OMGCmdOutput import OMGCmdOutput
 from omg.ui.OMGPopCard import HOVER_INTERACTIVE, install_pop_cards, show_click_card
 
@@ -136,8 +137,24 @@ KEY_BTN_SIZE = 24
 MASK_BLUR_RADIUS = 8
 # 标题栏「资源浏览」与右侧「透明度」控件之间的额外间距（叠加在布局 spacing 上）
 TITLE_GAP = 6
+# 面包屑左侧「索引」按钮（mm/arrow-down-a-z.svg，lucide 线稿）：把当前目录下的
+# 条目按**首字母**分组，点字母跳到该组第一个条目。内容区没有滚动条时索引无意义
+# （一眼就看完），故常态禁用，只有真的能滚才启用（见 _sync_index_btn）。
+INDEX_ICON = "mm/arrow-down-a-z.svg"
+INDEX_ICON_SIZE = 16
+INDEX_BTN_SIZE = 22
+# 面包屑的**加载占位**：首次扫描 Mods 期间面包屑还没有任何「屑」，整行是空白的，
+# 这里放一个循环进度圈 + 文案（与便捷构建-清理分页的加载提示同款），出结果后被
+# 真正的「屑」替换。只在**还没有渲染过任何目录**时显示——重扫时旧内容仍在屏上，
+# 再挂个「正在加载」反而误导。
+BC_LOADING_TEXT = "正在加载…"
+BC_LOADING_RING = 16       # 进度圈边长（面包屑行高 30，18 会略挤）
+BC_LOADING_GAP = 6         # 圈与文案的间距
 
 _KEY_ICON_CACHE: dict = {}
+
+
+_INDEX_ICON_CACHE: dict = {}
 
 
 def key_icon(hover: bool = False) -> "QIcon":
@@ -148,6 +165,23 @@ def key_icon(hover: bool = False) -> "QIcon":
         ic = tinted_icon(KEY_ICON, KEY_ICON_SIZE,
                          TEXT_PRIMARY if hover else TEXT_SECONDARY)
         _KEY_ICON_CACHE[tag] = ic
+    return ic
+
+
+def index_icon() -> "QIcon":
+    """索引按钮图标：启用态主前景色，**禁用态同标题栏「透明度」文本色**。
+
+    Qt 对禁用按钮会自动灰化图标（对原色做降饱和），得到的灰是算出来的、与主题
+    次级色不是一个值；这里显式给 ``QIcon.Disabled`` 挂一张 TEXT_SECONDARY 的图，
+    禁用态就能精确对齐标题栏次要文字（``QLabel#TitleHint``）的颜色。
+    """
+    ic = _INDEX_ICON_CACHE.get("x")
+    if ic is None:
+        ic = tinted_icon(INDEX_ICON, INDEX_ICON_SIZE, TEXT_PRIMARY)
+        dim = tinted_icon(INDEX_ICON, INDEX_ICON_SIZE, TEXT_SECONDARY)
+        ic.addPixmap(dim.pixmap(QSize(INDEX_ICON_SIZE, INDEX_ICON_SIZE)),
+                     QIcon.Disabled, QIcon.Off)
+        _INDEX_ICON_CACHE["x"] = ic
     return ic
 
 
@@ -461,6 +495,89 @@ def _wrapped_fits(text: str, fm: QFontMetrics, w: int, h: int) -> bool:
         return True
     return fm.boundingRect(QRect(0, 0, w, 1 << 20),
                            int(Qt.TextWordWrap), text).height() <= h
+
+
+# GBK 编码区段 → 拼音首字母（GB2312 一级汉字按拼音排序，故区间可直接映射到字母）。
+# 用于索引菜单给中文条目名取首字母（见 index_letter）。
+_GBK_INITIAL_BOUNDS = (
+    (0xB0A1, 0xB0C4, "A"), (0xB0C5, 0xB2C0, "B"), (0xB2C1, 0xB4ED, "C"),
+    (0xB4EE, 0xB6E9, "D"), (0xB6EA, 0xB7A1, "E"), (0xB7A2, 0xB8C0, "F"),
+    (0xB8C1, 0xB9FD, "G"), (0xB9FE, 0xBBF6, "H"), (0xBBF7, 0xBFA5, "J"),
+    (0xBFA6, 0xC0AB, "K"), (0xC0AC, 0xC2E7, "L"), (0xC2E8, 0xC4C2, "M"),
+    (0xC4C3, 0xC5B5, "N"), (0xC5B6, 0xC5BD, "O"), (0xC5BE, 0xC6D9, "P"),
+    (0xC6DA, 0xC8BA, "Q"), (0xC8BB, 0xC8F5, "R"), (0xC8F6, 0xCBF9, "S"),
+    (0xCBFA, 0xCDD9, "T"), (0xCDDA, 0xCEF3, "W"), (0xCEF4, 0xD1B8, "X"),
+    (0xD1B9, 0xD4D0, "Y"), (0xD4D1, 0xD7F9, "Z"),
+)
+# 既不是字母也不是汉字（数字 / 符号 / 日韩假名等）的条目归到这一组，排在最末
+INDEX_OTHER = "#"
+# pypinyin 惰性加载状态（见 _pinyin_initial）：None=还没试过，False 函数=不可用
+_PINYIN_FN: Optional[object] = None
+_PINYIN_READY = False
+
+
+def _pinyin_initial(name: str) -> Optional[str]:
+    """用 pypinyin 取首字的首字母；pypinyin 不可用则返回 ``None``（回落到 GBK 表）。
+
+    惰性 import：pypinyin 首次导入约 0.4s（词典加载），放在**第一次遇到中文名**
+    时才付这笔代价——纯英文目录全程不加载它，不影响启动耗时。
+    """
+    global _PINYIN_READY, _PINYIN_FN
+    if _PINYIN_FN is None and not _PINYIN_READY:
+        try:
+            from pypinyin import Style, lazy_pinyin
+
+            def _fn(text: str) -> Optional[str]:
+                letters = lazy_pinyin(text, style=Style.FIRST_LETTER)
+                first = letters[0] if letters else ""
+                # 非中文输入会被原样返回（甚至整串），这里只认单个字母
+                if len(first) == 1 and first.isalpha():
+                    return first.upper()
+                return None
+
+            _PINYIN_FN = _fn
+        except Exception:              # 未安装 / 打包时未收集 → 走 GBK 表
+            _PINYIN_FN = None
+        _PINYIN_READY = True
+    if _PINYIN_FN is None:
+        return None
+    try:
+        return _PINYIN_FN(name)
+    except Exception:                  # 词典异常之类：宁可降级，不要炸
+        return None
+
+
+def index_letter(name: str) -> str:
+    """条目名的**索引首字母**：英文取字母，中文取拼音首字母，其余归 ``#``。
+
+    优先级：
+      1. ASCII 字母直接大写（快路径，不碰词典）；
+      2. 中文 → ``pypinyin``（按词定音，覆盖 GB2312 之外的字，如 芙宁娜 → F、
+         魈 → X、绯 → F——这些在 GBK 区段表里都落在 # 组）；
+      3. pypinyin 不可用 → GBK 区段表 ``_GBK_INITIAL_BOUNDS`` 兜底（GB2312 一级
+         汉字按拼音排序，编码区间可直接映射到字母，如 甘雨 → G）。
+
+    取舍：零依赖的 GBK 表对常见字够用，但覆盖不全（GBK 扩展区的字无拼音序），
+    故做成「pypinyin 优先、表兜底」——发布包里若没收集 pypinyin，功能不消失，
+    只是少数生僻字落到 ``#`` 组。多音字只能取一个读音（如「重」恒为 Z）。
+    """
+    s = name.lstrip()
+    if not s:
+        return INDEX_OTHER
+    ch = s[0]
+    if ch.isascii():
+        return ch.upper() if ch.isalpha() else INDEX_OTHER
+    letter = _pinyin_initial(s)
+    if letter:
+        return letter
+    try:
+        code = int.from_bytes(ch.encode("gbk"), "big")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return INDEX_OTHER
+    for lo, hi, initial in _GBK_INITIAL_BOUNDS:
+        if lo <= code <= hi:
+            return initial
+    return INDEX_OTHER
 
 
 class ItemCard(CardBase):
@@ -1215,6 +1332,16 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._cmd_out: Optional[OMGCmdOutput] = None
         # 用户操作结果在状态栏展示期间，后台消息不覆盖（见 _set_status）
         self._status_hold = False
+        # 文件夹模式：**每个目录**的竖向滚动条位置（见 _remember/_restore_scroll）。
+        # 记录时机是「渲染别的目录之前」，键用绝对路径，返回该层时原样恢复。
+        self._scroll_pos: dict = {}
+        # 当前**已经渲染出来**的目录（可能已经不是 _selected_folder：
+        # navigate_to 会先把 _selected_folder 改掉再重渲染，故据此记录旧位置）
+        self._rendered_path: Optional[str] = None
+        # 异步恢复滚动位置的重入令牌：期间又切了目录就放弃旧的恢复
+        self._scroll_token = 0
+        # 索引菜单的原料：当前目录按显示顺序排列的 (首字母, 卡片)
+        self._index_items: List[Tuple[str, QWidget]] = []
 
         self.setStyleSheet(SETTINGS_QSS + MOD_QSS)
 
@@ -1633,6 +1760,9 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
             self._folder_layout.setColumnStretch(_c, 1)
         self._folder_scroll.setWidget(self._folder_content)
         fp_lay.addWidget(self._folder_scroll, 1)
+        # 滚动条出现 / 消失都会发 rangeChanged → 索引按钮随之启停（不必各处刷新）
+        self._folder_scroll.verticalScrollBar().rangeChanged.connect(
+            lambda _lo, _hi: self._sync_index_btn())
         self._stack.addWidget(self._folder_panel)
 
         self._selected_folder = None
@@ -1705,7 +1835,12 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         if not mods_dir:
             self._clear_content()
             self._show_empty("未配置 GIMI 目录（设置页 → GIMI 路径）")
+            # 没有可扫的目录 → 不会有渲染来撤占位，必须自己收掉
+            self._set_breadcrumb_loading(False)
             return
+        # 首次加载（还没渲染过任何目录）时面包屑是空白的 → 挂加载占位；
+        # 重扫时屏上还是上一次的内容，不挂。
+        self._set_breadcrumb_loading(self._rendered_path is None)
         self._status.setText("正在扫描 Mods…")
         sig = TaskSignals()
         sig.status.connect(self._on_scan_status)
@@ -1720,6 +1855,8 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
 
     def _on_scan_finished(self, ok: bool, msg: str) -> None:
         """扫描线程结束：取回结果缓存起来，再渲染。"""
+        # 兜底撤占位：auto 模式不走 _render_breadcrumb，占位不会自己消失
+        self._set_breadcrumb_loading(False)
         thread = self._scan_thread
         if ok and thread is not None:
             self._items = thread.items
@@ -1780,6 +1917,11 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
           * Mod    → ItemCard（左侧绿/灰状态条，单击切换启用）。
         子文件夹与 Mod 不再分先后，统一按名称升序混排（用户要求）。
         """
+        # 先把**此刻正在显示**的目录（_rendered_path）的滚动位置存下来——
+        # 进入下一级 / 跳回上一级都要走到这里，由此统一记录；同一目录的重渲染
+        # （启用切换等）也是先存后取，视觉上位置不跳。
+        self._remember_scroll()
+        self._index_items = []
         while self._folder_layout.count():
             w = self._folder_layout.takeAt(0).widget()
             if w is not None:
@@ -1787,11 +1929,13 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._render_breadcrumb()
         mods = self._mods_dir()
         if not mods:
+            self._finish_folder_render(None)
             self._show_folder_empty("未配置 GIMI 目录（设置页 → GIMI 路径）")
             return
         if self._selected_folder is None:
             self._selected_folder = mods
         if not self._items:
+            self._finish_folder_render(mods)
             self._show_folder_empty("Mods 文件夹为空，建好分组目录后把 mod 放进来")
             return
         sel = self._selected_folder
@@ -1831,6 +1975,7 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
                                 "item": self._synth_mod(fp)})
 
         if not entries:
+            self._finish_folder_render(sel)
             self._show_folder_empty("此文件夹下没有内容")
             return
 
@@ -1842,6 +1987,54 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
             else:
                 w = ItemCard(e["item"], self._folder_content, horizontal=True)
             self._folder_layout.addWidget(w, idx // _FOLDER_COLS, idx % _FOLDER_COLS)
+            # 索引菜单的原料：按显示顺序收集 (首字母, 卡片)
+            self._index_items.append((index_letter(e["name"]), w))
+        self._finish_folder_render(sel)
+
+    # ------------------------------------------------------------------
+    # 文件夹模式：滚动位置记忆（进入下一级前记，返回本级时恢复）
+    # ------------------------------------------------------------------
+    def _remember_scroll(self) -> None:
+        """记下当前正在显示的目录的滚动条位置（顶部 / 未渲染则不记）。"""
+        path = self._rendered_path
+        if not path:
+            return
+        v = self._folder_scroll.verticalScrollBar().value()
+        if v > 0:
+            self._scroll_pos[path] = v
+        else:
+            self._scroll_pos.pop(path, None)
+
+    def _finish_folder_render(self, path: Optional[str]) -> None:
+        """渲染收尾：登记已渲染目录 + 恢复滚动位置 + 刷新索引按钮可用性。"""
+        self._rendered_path = path
+        if path:
+            self._restore_scroll(path)
+        QTimer.singleShot(0, self._sync_index_btn)
+
+    def _restore_scroll(self, path: str) -> None:
+        """把滚动条恢复到上次离开该目录时的位置（没有记录则回顶部）。
+
+        首帧内容高度往往还没结算（``maximum`` 仍是 0，setValue 会被夹掉），
+        故延迟一帧再用；期间若又切了目录，令牌不一致则放弃这次恢复。
+        """
+        self._scroll_token += 1
+        token = self._scroll_token
+        want = self._scroll_pos.get(path, 0)
+
+        def _apply(tries: int = 0) -> None:
+            if token != self._scroll_token:
+                return
+            sb = self._folder_scroll.verticalScrollBar()
+            if want <= 0:
+                sb.setValue(0)
+                return
+            sb.setValue(min(want, sb.maximum()))
+            # 还没结算出内容高度 → 稍后再试（上限 5 次 ≈ 100ms）
+            if sb.maximum() <= 0 and tries < 5:
+                QTimer.singleShot(20, lambda: _apply(tries + 1))
+
+        QTimer.singleShot(0, _apply)
 
     def _synth_mod(self, path: str) -> dict:
         """为一个被手动标记为 Mod 的目录合成条目（扫描结果里没有它时）。"""
@@ -1927,12 +2120,73 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._breadcrumb = QWidget(self._frame)
         self._breadcrumb.setObjectName("Breadcrumb")
         self._breadcrumb.setFixedHeight(30)
-        self._bc_layout = QHBoxLayout(self._breadcrumb)
-        self._bc_layout.setContentsMargins(12, 2, 12, 2)
+        bc = QHBoxLayout(self._breadcrumb)
+        bc.setContentsMargins(12, 2, 12, 2)
+        bc.setSpacing(0)
+
+        # 「索引」按钮常驻在最左侧：它挂在 bc 上，而 _render_breadcrumb 只重建
+        # 右侧 _bc_track 里的「屑」，所以不会被连带 deleteLater。
+        self._btn_index = QPushButton(self._breadcrumb)
+        self._btn_index.setObjectName("BreadcrumbIndex")
+        self._btn_index.setFixedSize(INDEX_BTN_SIZE, INDEX_BTN_SIZE)
+        self._btn_index.setIcon(index_icon())
+        self._btn_index.setIconSize(QSize(INDEX_ICON_SIZE, INDEX_ICON_SIZE))
+        self._btn_index.setCursor(Qt.PointingHandCursor)
+        # 不设 toolTip：按钮本身已足够表意，且应用级提示过滤器会把带 toolTip
+        # 的控件做成悬浮即显的弹卡，这里不需要。
+        self._btn_index.setEnabled(False)     # 无滚动条时禁用（见 _sync_index_btn）
+        self._btn_index.clicked.connect(self._on_index_clicked)
+        bc.addWidget(self._btn_index)
+        bc.addSpacing(4)
+
+        # 加载占位（常驻，靠 setVisible 与「屑」互斥显示；构造时先隐藏）
+        self._bc_loading = QWidget(self._breadcrumb)
+        self._bc_loading.setObjectName("BreadcrumbLoading")
+        bl = QHBoxLayout(self._bc_loading)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(BC_LOADING_GAP)
+        self._bc_ring = DownloadProgressRing(self._bc_loading, size=BC_LOADING_RING,
+                                             thickness=2, cancellable=False)
+        self._bc_ring.setDark(True)
+        self._bc_ring.setAccentColor(ACCENT)
+        bl.addWidget(self._bc_ring)
+        tip = QLabel(BC_LOADING_TEXT, self._bc_loading)
+        tip.setObjectName("TitleHint")     # 次级灰 + 11px，与标题栏次要文字同款
+        bl.addWidget(tip)
+        bl.addStretch(1)
+        self._bc_loading.setVisible(False)
+        bc.addWidget(self._bc_loading)
+
+        # 「屑」的容器：内容在 _render_breadcrumb 里按当前路径动态重建
+        self._bc_track = QWidget(self._breadcrumb)
+        self._bc_layout = QHBoxLayout(self._bc_track)
+        self._bc_layout.setContentsMargins(0, 0, 0, 0)
         self._bc_layout.setSpacing(0)
+        bc.addWidget(self._bc_track, 1)
+
+    def _set_breadcrumb_loading(self, on: bool) -> None:
+        """显示 / 隐藏面包屑的加载占位，并同步进度圈的动画。
+
+        占位与「屑」互斥：显示占位时把「屑」容器一并藏掉（正常时序下首次加载
+        本来就没有屑；显式互斥可避免任何异常时序下「正在加载」和旧屑并排）。
+        隐藏占位时还必须把 indeterminate 关掉——否则它的 16ms 定时器会一直在
+        后台 tick，白白占一个重绘周期。
+        """
+        if not hasattr(self, "_bc_loading"):
+            return
+        self._bc_loading.setVisible(on)
+        self._bc_track.setVisible(not on)
+        self._bc_ring.set_indeterminate(on)
 
     def _render_breadcrumb(self) -> None:
-        """按当前路径重建面包屑：屑可点击回跳，› 点击弹该层子目录列表。"""
+        """按当前路径重建面包屑：屑可点击回跳，› 点击弹该层子目录列表。
+
+        每级「屑」另有右键菜单「从资源管理器打开」（见 ``_crumb_menu``）——
+        右键就地打开该层目录，比一路点进去再外层方便。
+
+        真正出「屑」就意味着加载结束，这里顺手撤掉加载占位。
+        """
+        self._set_breadcrumb_loading(False)
         while self._bc_layout.count():
             w = self._bc_layout.takeAt(0).widget()
             if w is not None:
@@ -1942,18 +2196,70 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
             if i > 0:
                 # 分隔符 ›：列出其左侧「屑」路径下的直接子目录，供快速跳转
                 prev_path = segs[i - 1][1]
-                sep = QPushButton("›", self._breadcrumb)
+                sep = QPushButton("›", self._bc_track)
                 sep.setObjectName("BreadcrumbSep")
                 sep.setCursor(Qt.PointingHandCursor)
                 sep.clicked.connect(
                     lambda *_, p=prev_path: self._bc_sep_menu(p))
                 self._bc_layout.addWidget(sep)
-            crumb = QPushButton(label, self._breadcrumb)
+            crumb = QPushButton(label, self._bc_track)
             crumb.setObjectName("BreadcrumbCrumb")
             crumb.setCursor(Qt.PointingHandCursor)
             crumb.clicked.connect(lambda *_, p=path: self.navigate_to(p))
+            crumb.setContextMenuPolicy(Qt.CustomContextMenu)
+            crumb.customContextMenuRequested.connect(
+                lambda _pt, p=path: self._crumb_menu(p))
             self._bc_layout.addWidget(crumb)
         self._bc_layout.addStretch(1)
+
+    def _crumb_menu(self, path: str) -> None:
+        """面包屑某级的右键菜单：从资源管理器打开该级目录。"""
+        menu = QMenu(self)
+        act_open = menu.addAction("从资源管理器打开")
+        act = menu.exec(QCursor.pos())
+        if act == act_open and path and os.path.isdir(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    # ---- 首字母索引 ----
+    def _sync_index_btn(self) -> None:
+        """索引按钮可用性：**只有内容区真的可以滚动**时才启用。
+
+        绑定竖向滚动条的 ``rangeChanged``——渲染完内容、窗口缩放导致出现/消失
+        滚动条都会触发，不必在各处手动刷新。
+        """
+        btn = getattr(self, "_btn_index", None)
+        if btn is None:
+            return
+        btn.setEnabled(self._folder_scroll.verticalScrollBar().maximum() > 0)
+
+    def _on_index_clicked(self) -> None:
+        """索引按钮：弹出当前目录出现过的首字母，选中即滚到该组第一个条目。"""
+        menu = QMenu(self)
+        first_of: dict = {}
+        order: List[str] = []
+        for letter, widget in self._index_items:
+            if letter not in first_of:
+                first_of[letter] = widget
+                order.append(letter)
+        if not order:
+            act = menu.addAction("（当前目录没有内容）")
+            act.setEnabled(False)
+            menu.exec(QCursor.pos())
+            return
+        # 「#」组永远排在最末
+        order.sort(key=lambda l: (l == INDEX_OTHER, l))
+        for letter in order:
+            act = menu.addAction(letter)
+            act.triggered.connect(
+                lambda _checked, w=first_of[letter]: self._scroll_to_card(w))
+        menu.exec(QCursor.pos())
+
+    def _scroll_to_card(self, widget: QWidget) -> None:
+        """把某张卡片滚进视野（索引跳转的最小滚动量）。"""
+        try:
+            self._folder_scroll.ensureWidgetVisible(widget, 0, 8)
+        except RuntimeError:      # 卡片已被销毁（渲染正在重建）
+            pass
 
     def _bc_sep_menu(self, path: str) -> None:
         """分隔符 › 被点击：弹出 path 下的直接子目录列表，选中即跳转。"""
@@ -2395,6 +2701,13 @@ QListWidget::item {{ padding: 6px 10px; border-radius: 4px; }}
 QListWidget::item:selected {{ background: {ACCENT}; color: {TEXT_ON_ACCENT}; }}
 
 QWidget#Breadcrumb {{ background: transparent; }}
+/* 面包屑左侧「索引」按钮：外观与屑一致（无边框、hover 高亮）。禁用态不画
+   hover；禁用图标颜色由 index_icon() 显式挂 QIcon.Disabled 图（= TEXT_SECONDARY，
+   同标题栏次要文字），不靠 Qt 的自动灰化。 */
+QPushButton#BreadcrumbIndex {{
+    background: transparent; border: none; padding: 2px; border-radius: 4px;
+}}
+QPushButton#BreadcrumbIndex:hover:enabled {{ background: {BG_CARD_HOVER}; }}
 QPushButton#BreadcrumbCrumb {{
     background: transparent; border: none;
     color: {ACCENT}; font-size: 12px; padding: 2px 5px; border-radius: 4px;

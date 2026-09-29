@@ -46,6 +46,10 @@ LOG_DIR = os.path.join(_EXE_DIR, "log")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, f"omg_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 GIMI_DIR = os.path.join(OMG_ROOT, "GIMI")
+# 缓存目录（与 config.json 同级）：存放可被安全重建的本地缓存 / 记忆文件
+CACHE_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "cache")
+# 便捷构建页选项记忆（源 / 版本 / 各开关等），落盘为 cache/qb_selected.json
+QB_SELECTED_FILE = os.path.join(CACHE_DIR, "qb_selected.json")
 # 资源统一根目录（icons/bg/binaries 均位于 resources/ 下）。
 # 开发模式下锚定到本文件所在包 (src/omg)，与启动方式 (sys.argv[0]) 解耦——
 # 否则不同入口会算出「缺少 src/omg 一层」的错误路径（如 OMGLite/resources/binaries）。

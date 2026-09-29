@@ -64,6 +64,7 @@ SETTINGS_QSS（令牌 TEXT_ON_ACCENT = 白色），设置页与便捷构建页�
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -124,6 +125,39 @@ def _dir_size(path: str) -> int:
     except OSError:
         pass
     return total
+
+
+# ---------------------------------------------------------------------------
+# 选项持久化（cache/qb_selected.json）
+# ---------------------------------------------------------------------------
+# 便捷构建页的「选项」指用户在卡片里做出的所有选择：源、版本、项目、优化构建、
+# 神秘仪式（开关 + 类型）、复制到 GIMI、构建完成后执行神秘仪式、以及手动改选的
+# 目标文件。这些与构建产物无关、纯粹是 UI 偏好，关闭窗口后下次打开应原样恢复，
+# 因此集中落盘到 cache/qb_selected.json（与 config.json 同级，可被安全重建）。
+def _load_qb_selected() -> dict:
+    """读取上次保存的选项；文件缺失 / 损坏时返回空 dict（走全部默认值）。"""
+    try:
+        if not os.path.isfile(paths.QB_SELECTED_FILE):
+            return {}
+        with open(paths.QB_SELECTED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:  # 兜底：任何异常都回退到默认值，绝不阻断窗口打开
+        logger.warning("便捷构建: 读取选项记忆失败 %s", e)
+    return {}
+
+
+def _save_qb_selected(data: dict) -> None:
+    """原子写入选项记忆：先写 .tmp 再 os.replace 覆盖，避免半截文件。"""
+    try:
+        os.makedirs(paths.CACHE_DIR, exist_ok=True)
+        tmp = paths.QB_SELECTED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, paths.QB_SELECTED_FILE)
+    except Exception as e:
+        logger.warning("便捷构建: 保存选项记忆失败 %s", e)
 
 # 图标目录（resources/icons，与 home 页的 icons/home 平级）。
 # 统一走 paths.ICONS_DIR：开发态解析到 src/omg/resources/icons，
@@ -579,6 +613,13 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._target_custom: bool = False    # 目标文件是否被用户手动浏览改选
         self._env_report = None              # 最近一次构建环境检测报告（build_env.EnvReport）
 
+        # 选项持久化：拉取 / 刷新完成前，先缓存待选中的「版本 / 项目」，待数据
+        # 就绪后回填到下拉框；_init_done 用于在初始化回填期间屏蔽写盘（避免把
+        # 尚未拉取到的版本号误写成空串）。
+        self._pending_version: str = ""
+        self._pending_project: str = ""
+        self._init_done: bool = False
+
         self._fetch_thread = None
         self._dl_thread = None          # GitHub 源码：下载源码 zip
         self._pdl_thread = None         # 已构建文件：下载蓝奏云压缩包
@@ -614,7 +655,9 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
 
         # ---- 初始化各卡片的动态数据 ----
         # 注意顺序：环境检测依赖「项目」下拉框的当前选中项，故先刷新项目再检测。
-        self._refresh_projects()
+        # 先应用上次持久化的选项（源 / 开关 / 分段 / 待选项目与版本），再刷新动态数据。
+        self._apply_saved_selection()
+        self._refresh_projects(select=self._pending_project)
         self._refresh_env()
         self._sync_target_default()
         self._start_fetch_releases()
@@ -634,8 +677,99 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         # 默认进入主分页（构建），无论上次退出时停留在哪一页
         self._show_page("main")
 
+        # 初始化回填完成：开放写盘，并把当前（已应用记忆的）完整状态落盘一次。
+        # 此后任何选项变化都会即时写入 cache/qb_selected.json（见 _save_selection）。
+        self._init_done = True
+        self._save_selection()
+
         # 自定义 tooltip 气泡：覆盖本窗口所有控件，屏蔽原生 QToolTip 直角 + 阴影。
         install_pop_cards(self, lambda: "dark")
+
+    # ------------------------------------------------------------------
+    # 选项持久化（cache/qb_selected.json）
+    # ------------------------------------------------------------------
+    def _current_release_version(self) -> Optional[str]:
+        """当前选中的 release 版本号（选中动作项 / 列表为空时返回 None）。"""
+        combo = self._combo_version
+        idx = combo.currentIndex()
+        if idx < 0 or combo.is_action_index(idx):
+            return None
+        if 0 <= idx < len(self._versions):
+            return self._versions[idx]
+        return None
+
+    def _save_selection(self) -> None:
+        """把当前所有选项收集成 dict 并原子写入 cache/qb_selected.json。
+
+        初始化回填期间（``_init_done`` 为 False）不写盘，避免把尚未拉取到的
+        版本号误写成空串覆盖掉记忆。
+        """
+        if not self._init_done:
+            return
+        data = {
+            "_format": 1,
+            "source": self._seg_source.currentIndex(),
+            # 版本下拉框在拉取完成前为空：用待选中值兜底，避免把记忆覆盖成空串
+            # （fetch 失败时也能保住上次记住的版本）。
+            "release_version": self._current_release_version() or self._pending_version or "",
+            "project_version": self._current_project_version() or "",
+            "optimize": self._switch_optimize.on,
+            "ritual_enabled": self._switch_ritual.on,
+            "ritual_type": self._seg_ritual.currentIndex(),
+            "copy_target": self._seg_copy.currentIndex(),
+            "auto_ritual": self._switch_auto_ritual.on,
+            "target_custom": self._target_custom,
+            "target_path": self._edit_target.text().strip()
+            if self._target_custom else "",
+        }
+        _save_qb_selected(data)
+
+    def _apply_saved_selection(self) -> None:
+        """打开窗口时，把 cache/qb_selected.json 中的选项回填到 UI。
+
+        仅回填「当前环境允许」的项：版本 / 项目因依赖异步拉取或目录扫描，先缓存
+        到 ``_pending_*``，待数据就绪后在对应回调里选中；目标文件仅在「用户曾手动
+        改选且文件仍存在」时恢复，否则交给默认值逻辑。
+        """
+        data = _load_qb_selected()
+        if not data:
+            return
+
+        # 源：索引 0=GitHub 源码 / 1=已构建文件（setCurrent 会触发 _on_source_changed）
+        src = data.get("source", 0)
+        if src in (0, 1):
+            self._seg_source.setCurrent(src)
+
+        # 三个开关：setOn 在值变化时发 toggled（触发对应联动）。
+        if "ritual_enabled" in data:
+            self._switch_ritual.setOn(bool(data["ritual_enabled"]))
+        if "optimize" in data:
+            self._switch_optimize.setOn(bool(data["optimize"]))
+        if "auto_ritual" in data:
+            self._switch_auto_ritual.setOn(bool(data["auto_ritual"]))
+
+        # 两个分段控件：仪式类型 [包装/涂装(py)/涂装(rs)]、复制到 GIMI [构建产物/仪式产物]
+        rt = data.get("ritual_type", 0)
+        if 0 <= int(rt) <= 2:
+            self._seg_ritual.setCurrent(int(rt))
+        ct = data.get("copy_target", 0)
+        if ct in (0, 1):
+            self._seg_copy.setCurrent(int(ct))
+
+        # 项目（同步刷新时选中）/ 版本（异步拉取完成后选中）
+        pv = data.get("project_version", "")
+        if pv:
+            self._pending_project = pv
+        rv = data.get("release_version", "")
+        if rv:
+            self._pending_version = rv
+
+        # 目标文件：仅当用户曾手动改选且文件仍存在时恢复；否则保持默认回填逻辑。
+        if data.get("target_custom") and data.get("target_path"):
+            p = data["target_path"]
+            if os.path.isfile(p):
+                self._edit_target.setText(p)
+                self._target_custom = True
 
     def _wire_signals(self) -> None:
         """把各任务的进度 / 状态 / 结果信号接到 UI（只接一次）。"""
@@ -665,6 +799,15 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
 
         # 「优化构建」会改变检测项（开启后多一项「注入基线」），切换后重跑一次
         self._switch_optimize.toggled.connect(lambda _on: self._refresh_env())
+
+        # ---- 选项持久化：任一选项变化即写入 cache/qb_selected.json ----
+        # 源 / 三个开关 / 两个分段控件，统一在变化后落盘（即时生效，不依赖关闭）。
+        self._seg_source.currentChanged.connect(lambda _i: self._save_selection())
+        self._switch_optimize.toggled.connect(lambda _o: self._save_selection())
+        self._switch_ritual.toggled.connect(lambda _o: self._save_selection())
+        self._switch_auto_ritual.toggled.connect(lambda _o: self._save_selection())
+        self._seg_ritual.currentChanged.connect(lambda _i: self._save_selection())
+        self._seg_copy.currentChanged.connect(lambda _i: self._save_selection())
 
     # ------------------------------------------------------------------
     # 命令输出侧页（构建 / 文件优化）
@@ -1135,9 +1278,11 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         combo.blockSignals(False)
 
     def _on_version_activated(self, index: int) -> None:
-        """末项 = 「重新拉取」→ 重新拉取版本列表。"""
+        """末项 = 「重新拉取」→ 重新拉取版本列表；否则选中了某个版本 → 落盘。"""
         if self._combo_version.is_action_index(index):
             self._start_fetch_releases()
+        else:
+            self._save_selection()
 
     def _on_releases_ready(self, entries: list) -> None:
         if not entries:
@@ -1157,8 +1302,11 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
 
         self._releases = list(entries)
         self._versions = [e.get("version", "") for e in self._releases]
-        # 成功：默认选中最新版本（列表已按新→旧排序）
-        self._render_version_combo(self._versions, _TEXT_REFETCH, True)
+        # 成功：默认选中最新版本（列表已按新→旧排序）；若有持久化的上次选择且
+        # 仍在列表中，则优先选中它。渲染后写盘，确保选中的版本号被记住。
+        self._render_version_combo(self._versions, _TEXT_REFETCH, True,
+                                   select=self._pending_version)
+        self._save_selection()
 
     def _current_release(self) -> Optional[dict]:
         """当前选中的 release 条目（选中末项或列表为空时返回 None）。"""
@@ -1322,6 +1470,8 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         if self._combo_project.is_action_index(index):
             self._refresh_projects(select=self._current_project_version())
         self._refresh_env()
+        # 切换项目即视为选项变化 → 落盘（记住上次选中的项目）
+        self._save_selection()
 
     def _current_project_version(self) -> Optional[str]:
         combo = self._combo_project
@@ -1425,6 +1575,8 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
             return
         self._edit_target.setText(path)
         self._target_custom = True
+        # 手动改选目标文件 → 落盘记忆
+        self._save_selection()
 
     def _ritual_kind(self) -> str:
         mapping = (
@@ -1887,6 +2039,8 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         真正结束后自动回收，无需在此等待。
         """
         running = self._running_threads()
+        # 关闭前把当前选项落盘（兜底：任何未即时落盘的变化都在此补齐）
+        self._save_selection()
         if not running:
             super().closeEvent(event)
             return
