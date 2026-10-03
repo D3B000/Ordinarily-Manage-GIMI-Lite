@@ -689,6 +689,33 @@ def _is_locked(path: str) -> bool:
         return True
 
 
+def _check_version_header(root: str) -> CheckItem:
+    """检查「版本头生成」这一前置是否会被MSB3073 卡住。
+
+    1.2.0 起入口工程多了 ``GenerateVersionHeader`` Target，它调用的
+    ``generate-version.ps1`` 依赖 ``.git``，而下载的源码 zip 里没有 —— 不处理
+    就会以 ``error MSB3073`` 收尾。OMGLite 已在构建前自动预处理
+    （见 :mod:`omg.core.source_prep`），所以这里只要报「待处理」当提醒。
+    """
+    from omg.core import source_prep
+
+    try:
+        if source_prep.is_git_repo(root):
+            return CheckItem("project.version", "版本头生成", STATUS_OK,
+                             "Git 仓库", "走上游原生版本生成")
+        if not source_prep.needs_patch(root):
+            return CheckItem("project.version", "版本头生成", STATUS_OK,
+                             "已处理", "构建前会自动补齐")
+        ver = source_prep.version_tuple(root)
+        detail = ".".join(str(p) for p in ver) if ver else "未知版本"
+        return CheckItem("project.version", "版本头生成", STATUS_WARN,
+                         detail, "源码包非 Git 仓库，构建前会自动补齐",
+                         FixAction(FIX_NONE, "无需处理", ""))
+    except Exception as e:  # noqa: BLE001 - 检测绝不能拖垮整体
+        logger.warning("版本头检测异常: %s", e)
+        return CheckItem("project.version", "版本头生成", STATUS_SKIP, "检测失败")
+
+
 def check_runtime(root: str, optimize: bool = False,
                   config: str = DEFAULT_CONFIG,
                   platform: str = DEFAULT_PLATFORM) -> List[CheckItem]:
@@ -724,6 +751,10 @@ def check_runtime(root: str, optimize: bool = False,
             f"{len(os.path.abspath(root))} 字符",
             f"超过 {MAX_ROOT_LEN} 字符，深层子目录可能触到 MAX_PATH",
             FixAction(FIX_DIR, "打开目录", os.path.abspath(root))))
+
+    # --- 版本头生成（1.2.0+ 的源码包不是 Git 仓库 → MSB3073）---
+    if root and os.path.isdir(root):
+        items.append(_check_version_header(root))
 
     # --- 注入基线（仅「优化构建」开启时才有意义）---
     if optimize and root:
@@ -797,6 +828,14 @@ _ERROR_RULES = (
     (r"MSB8036", "缺少 Windows SDK",
      "装任意 Windows 10/11 SDK（10.0.x 均可）后重试",
      FIX_URL, URL_WINSDK),
+    # 必须排在下面的 MSB3073 通用规则之前：generate-version.ps1 在非 Git 仓库里
+    # 会以 MSB3073 收尾，但根因与「Dependencies 为空」毫无关系，重新下载没用。
+    (r"Not inside a Git repository|not a git repository"
+     r"|generate-version\.ps1",
+     "源码包不是 Git 仓库",
+     "工程要用 git 拼版本信息，而下载的源码 zip 里没有 .git；"
+     "新版本已自动处理，若仍失败请更新 OMG",
+     FIX_NONE, ""),
     (r"MSB3073", "构建后步骤失败",
      "多半是 Dependencies 目录为空或路径异常，重新下载源码可修复",
      FIX_REFETCH, ""),

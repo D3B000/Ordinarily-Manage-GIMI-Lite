@@ -52,8 +52,10 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from omg.core import build_env
 from omg.core import download
 from omg.core import lanzou
+from omg.core import source_prep
 from omg.core import updates
 from omg.core.gimi_update import DownloadSignals, _parse_version
 from omg.core.logging_setup import logger
@@ -379,6 +381,16 @@ def download_and_extract(release: dict, signals: DownloadSignals,
             pass
 
     _p(100.0)
+
+    # 源码 zip 里没有 .git，而 1.2.0+ 的入口工程会用 git 拼版本头（缺了会以
+    # MSB3073 收尾）→ 解压完就地补齐，见 omg.core.source_prep。
+    target = project_dir_for(version)
+    prep = source_prep.prepare_source(target)
+    if prep.changed:
+        logger.info("源码预处理（%s）: %s", version, prep.detail)
+    elif prep.skipped and prep.skipped != "已处理":
+        logger.info("源码预处理跳过（%s）: %s", version, prep.detail)
+
     return True, f"源码已就绪 {version}"
 
 
@@ -715,6 +727,15 @@ def build_project(version: str, optimize: bool = False,
     from omg.domain.ritual import d3d11_builder
 
     ensure_dirs()
+
+    # 兜底预处理：源码可能是本次会话之前解压的（当时还没这个补丁），
+    # 这里再调一次，就地修好而不必让用户重新下载一遍。幂等，代价可忽略。
+    prep = source_prep.prepare_source(root)
+    if prep.changed:
+        logger.info("构建前源码预处理: %s", prep.detail)
+    if not prep.ok:
+        return False, f"源码预处理失败：{prep.detail}"
+
     return d3d11_builder.run_build(
         output_dir=ARTIFACT_DIR,
         callback=callback,
@@ -1101,7 +1122,9 @@ class BuildThread(_CancelThread):
             path = info.get("path", ARTIFACT_DLL) if isinstance(info, dict) else info
             self._emit_finished(True, path)
         else:
-            self._emit_finished(False, info)
+            # 原始 err_msg 是 MSBuild 输出的尾巴（常只剩 NativeCommandError 这类
+            # 无信息行），翻译一次才能给出「缺工具集 / 源码不是 Git 仓库」等人话。
+            self._emit_finished(False, build_env.describe_build_error(str(info)))
 
 
 class RitualThread(_CancelThread):
