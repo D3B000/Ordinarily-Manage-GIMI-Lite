@@ -40,7 +40,8 @@ import sys
 import ctypes
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QPoint, QSize, QUrl, QRect, QRectF, Signal, QTimer
+from PySide6.QtCore import (QEvent, Qt, QPoint, QSize, QUrl, QRect, QRectF,
+                            Signal, QTimer)
 from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFontMetrics,
                            QIcon, QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (
@@ -137,6 +138,9 @@ KEY_BTN_SIZE = 24
 MASK_BLUR_RADIUS = 8
 # 标题栏「资源浏览」与右侧「透明度」控件之间的额外间距（叠加在布局 spacing 上）
 TITLE_GAP = 6
+# 检测到「缓存与磁盘不一致」（外部改名 / 删除）后，延迟多久补一次重扫：
+# 去抖用——资源管理器里连续改多个目录会触发多次渲染，合并成一次扫描。
+RESCAN_DELAY_MS = 400
 # 面包屑左侧「索引」按钮（mm/arrow-down-a-z.svg，lucide 线稿）：把当前目录下的
 # 条目按**首字母**分组，点字母跳到该组第一个条目。内容区没有滚动条时索引无意义
 # （一眼就看完），故常态禁用，只有真的能滚才启用（见 _sync_index_btn）。
@@ -1342,6 +1346,10 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._scroll_token = 0
         # 索引菜单的原料：当前目录按显示顺序排列的 (首字母, 卡片)
         self._index_items: List[Tuple[str, QWidget]] = []
+        # 外部改动（资源管理器里改名 / 增删）后的补救重扫：去抖定时器 + 需要
+        # 「当前这轮扫完再扫一次」的标记（改动发生在扫描途中时用到）
+        self._rescan_timer: Optional[QTimer] = None
+        self._rescan_again = False
 
         self.setStyleSheet(SETTINGS_QSS + MOD_QSS)
 
@@ -1614,6 +1622,19 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         if getattr(self, "_opacity_edit", None) is not None:
             QTimer.singleShot(0, self._opacity_edit.clearFocus)
 
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        """窗口激活状态变化：从别的应用（典型是资源管理器）切回来时补一次重扫。
+
+        外部改名 / 增删不会给本进程任何事件，而扫描只在 showEvent 做过一次，
+        于是内容区会一直用旧缓存渲染（表现为「外面改了名，这边还是旧的」甚至
+        新旧卡片并存）。这里把「重新获得激活」当作外部可能动过盘的信号，排一次
+        去抖重扫——激活 / 失焦来回抖动由 ``_schedule_rescan`` 合并成一次。
+        """
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.ActivationChange
+                and self.isActiveWindow()):
+            self._schedule_rescan()
+
     def paintEvent(self, event) -> None:  # type: ignore[override]
         """磨砂透明背景（与首页 HomeWindow 同款）：自绘半透明圆角面板。
 
@@ -1871,6 +1892,10 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
         self._scan_sig = None
         self._update_status()
         self._render()
+        # 这一轮扫描期间又发生了外部改动（目录列表是开始时的快照，扫不到）→ 补一轮
+        if self._rescan_again:
+            self._rescan_again = False
+            self._schedule_rescan(0)
 
     def _reclassify(self) -> None:
         """仅重分类（**不读盘**）：复用缓存的 _items 在内存里重跑分类。
@@ -1893,6 +1918,9 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
 
     def _render_auto(self) -> None:
         """自动分类模式：按一级 / 二级筛选渲染分组卡片网格（原单栏逻辑）。"""
+        # 与文件夹模式同理：先按磁盘现状剔掉外部改名 / 删除留下的幽灵条目
+        if self._drop_gone_items():
+            self._schedule_rescan()
         self._clear_content()
         if not self._mods_dir():
             self._show_empty("未配置 GIMI 目录（设置页 → GIMI 路径）")
@@ -1907,6 +1935,72 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
             return
         for g in groups:
             self._content_layout.addWidget(self._make_group(g))
+
+    def _drop_gone_items(self, scope: Optional[set] = None) -> int:
+        """剔除缓存里**磁盘上已不存在**的条目（外部改名 / 删除留下的幽灵）。
+
+        渲染网格时「直接子目录」是实时读盘的，而 Mod 条目来自扫描缓存——两者
+        不一致就会出现「旧名卡片 + 新名卡片」并存。故渲染前先按磁盘现状清一遍。
+
+        Args:
+            scope: 限定只检查这些路径。文件夹模式传当前目录的直接子项（数量小，
+                开销可控）；None 表示全量检查（自动分类模式用）。
+
+        Returns:
+            被剔除的条数（>0 说明外部动过盘，调用方应排一次补救重扫）。
+
+        注意 ``_items``（原始扫描）与 ``_classified``（分类结果）是**两份拷贝**，
+        只清一份仍会拼出幽灵卡片，必须同步。
+        """
+        def _gone(p: str) -> bool:
+            return not p or not os.path.exists(p)
+
+        dead: set = ({p for p in scope if _gone(p)} if scope is not None
+                     else {it.get("path", "") for it in self._items
+                           if _gone(it.get("path", ""))})
+        if not dead:
+            return 0
+        self._items = [it for it in self._items
+                       if it.get("path") not in dead]
+        self._classified = [c for c in self._classified
+                            if c.get("path") not in dead]
+        return len(dead)
+
+    def _schedule_rescan(self, delay: int = RESCAN_DELAY_MS) -> None:
+        """排一次补救重扫（去抖：连续多次不一致只扫一次）。
+
+        扫描期间发生的外部改动不会被这一轮扫到（目录列表是扫描开始时的快照），
+        故此时只记 ``_rescan_again``，等 ``_on_scan_finished`` 再补一轮。
+        """
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._rescan_again = True
+            return
+        if self._rescan_timer is None:
+            self._rescan_timer = QTimer(self)
+            self._rescan_timer.setSingleShot(True)
+            # 用 lambda 延迟到触发时再取——测试会替换实例上的 _start_scan
+            self._rescan_timer.timeout.connect(lambda: self._start_scan())
+        self._rescan_timer.start(delay)
+
+    def _resolve_selected(self, mods: str) -> str:
+        """当前选中目录若已被外部改名 / 删除，回退到**最近的存在祖先**。
+
+        否则面包屑与网格会指向一个不存在的路径（点进去空白、屑也点不动）。
+        上溯限制在 Mods 之内，避免一路退到无关的上级目录。
+        """
+        sel = self._selected_folder or mods
+        if not os.path.isdir(mods) or os.path.isdir(sel):
+            self._selected_folder = sel
+            return sel
+        root = os.path.normpath(mods)
+        cur = os.path.dirname(os.path.normpath(sel))
+        while cur and (cur == root or cur.startswith(root + os.sep)):
+            if os.path.isdir(cur):
+                self._selected_folder = cur
+                return cur
+            cur = os.path.dirname(cur)
+        self._selected_folder = root
+        return root
 
     def _render_folder_contents(self) -> None:
         """文件夹模式：面包屑 + 单层卡片网格（子文件夹与 Mod 混排，按名称升序）。
@@ -1938,7 +2032,18 @@ class ResourcesWindow(CenteredPopupMixin, QWidget):
             self._finish_folder_render(mods)
             self._show_folder_empty("Mods 文件夹为空，建好分组目录后把 mod 放进来")
             return
-        sel = self._selected_folder
+        # 当前目录本身可能已被外部改名 / 删除 → 退到最近的存在祖先
+        sel = self._resolve_selected(mods)
+        # 外部改名 / 删除后，这里会残留磁盘上已不存在的路径；剔除后再取一次，
+        # 否则旧条目（缓存）与新目录（实时读盘）会各出一张卡片。
+        # 只检查本目录的直接子项——全量 stat 在网盘 GIMI 上会明显卡顿。
+        if self._drop_gone_items({it["path"] for it in self._classified
+                                  if os.path.dirname(it["path"]) == sel}):
+            self._schedule_rescan()   # 补上新目录的元数据（缩略图 / 切换键）
+        if not self._items:
+            self._finish_folder_render(sel)
+            self._show_folder_empty("Mods 文件夹为空，建好分组目录后把 mod 放进来")
+            return
         # 直接子 Mod（父目录 == 选中文件夹的扫描条目）。
         # 用 _classified（而非 _items）：分类结果已附上 thumb 字段，Mod 卡片才能
         # 显示目录下以 preview 命名的预览图。

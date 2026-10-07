@@ -619,6 +619,10 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         self._pending_version: str = ""
         self._pending_project: str = ""
         self._init_done: bool = False
+        # 回填持久化选项期间（True）屏蔽环境检测触发：避免开关回填（optimize）提前
+        # 起一次 env 线程、而此时「项目」下拉框尚未选中目标项，导致首次打开检测到的
+        # 是错误/空项目，并因重入保护挡掉初始化末尾那次正确的检测（需手动点「重新检测」）。
+        self._applying_saved: bool = False
 
         self._fetch_thread = None
         self._dl_thread = None          # GitHub 源码：下载源码 zip
@@ -730,9 +734,13 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         仅回填「当前环境允许」的项：版本 / 项目因依赖异步拉取或目录扫描，先缓存
         到 ``_pending_*``，待数据就绪后在对应回调里选中；目标文件仅在「用户曾手动
         改选且文件仍存在」时恢复，否则交给默认值逻辑。
+
+        回填期间置 ``_applying_saved=True``，屏蔽环境检测触发（见 :meth:`_refresh_env`）。
         """
+        self._applying_saved = True
         data = _load_qb_selected()
         if not data:
+            self._applying_saved = False
             return
 
         # 源：索引 0=GitHub 源码 / 1=已构建文件（setCurrent 会触发 _on_source_changed）
@@ -770,6 +778,9 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
             if os.path.isfile(p):
                 self._edit_target.setText(p)
                 self._target_custom = True
+
+        # 回填结束：开放环境检测触发（随后 __init__ 会跑一次正确的检测）。
+        self._applying_saved = False
 
     def _wire_signals(self) -> None:
         """把各任务的进度 / 状态 / 结果信号接到 UI（只接一次）。"""
@@ -1384,6 +1395,11 @@ class QuickBuildWindow(CenteredPopupMixin, QWidget):
         因此统一走 ``EnvCheckThread``；期间状态标签显示「检测中…」。
         依赖「项目」下拉框的当前选中项（源码根目录由它决定）。
         """
+        # 回填持久化选项期间不触发：开关（optimize）回填会改发 toggled，若此刻起
+        # env 线程，「项目」下拉框还没选中目标项，会检测到错误项目；且会因其仍在运行
+        # 挡掉 __init__ 末尾那次正确的检测（需手动点「重新检测」才识别）。
+        if self._applying_saved:
+            return
         if self._env_thread is not None and self._env_thread.isRunning():
             return  # 防重入：上一次还没跑完就不重复起线程
         self._lbl_env.set_state(_TEXT_ENV_PENDING, _ENV_COLOR_PENDING)
