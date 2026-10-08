@@ -737,6 +737,11 @@ class HomeWindow(CenteredPopupMixin, QWidget):
         self._local_version = ""
         self._remote_version = ""
 
+        # 启动按钮提示的「状态文案」覆盖层：注入中 / 已注入 / 失败原因等由
+        # LaunchController 经 _on_launch_state 写入。为空时才回落到按配置算出的
+        # 防误触文案。必须在 _build_ui() 之前就位——后者会调 _refresh_start_tooltip。
+        self._launch_status_tip = ""
+
         # 闲置变淡：时机决策在 omg.core.idle_fade_fsm（纯逻辑），
         # 计时与缓动由 omg.ui.idle_fade.IdleFadeController 托管。
         # attach() 在 _build_ui() 之后调用——判定光标是否在窗口内需要确定的几何。
@@ -1553,6 +1558,21 @@ class HomeWindow(CenteredPopupMixin, QWidget):
             # 「关闭瞬间 isVisible() 仍为真把 child 误置 True 且外界纠正不可靠」
             # 导致的启动页闲置淡化永久失效。
             self._settings_win.installEventFilter(self)
+            # 防误触（开关 / 长按时间）改动后立刻刷新启动按钮提示。
+            # 设置页只把值写进共享 ConfigManager，不会通知首页重算文案，
+            # 于是按钮提示会一直停在启动时的旧文字，必须显式接一下。
+            # 连接放在 SettingsWindow 构造之后：SettingsController.bind()
+            # 先连（同一信号的槽按连接顺序调用），保证本槽读到的是落盘后的新值。
+            omg_page = getattr(self._settings_win, "omg_page", None)
+            if omg_page is not None:
+                omg_page.launch_hold_toggled.connect(
+                    lambda _on: self._refresh_start_tooltip())
+                omg_page.launch_hold_ms_changed.connect(
+                    lambda _ms: self._refresh_start_tooltip())
+        else:
+            # 已存在的设置窗：每次打开都重算一次，作为「外部改过配置文件」
+            # 等无信号路径的兜底（幂等，值未变时 setToolTip 同文案无副作用）。
+            self._refresh_start_tooltip()
         self._settings_win.show()
         self._settings_win.raise_()
         self._settings_win.activateWindow()
@@ -1643,7 +1663,15 @@ class HomeWindow(CenteredPopupMixin, QWidget):
             self._launch.toggle()
 
     def _refresh_start_tooltip(self) -> None:
-        """按当前配置刷新启动按钮提示：防误触开启时标注「长按 Xms 启动」。"""
+        """按当前配置刷新启动按钮提示：防误触开启时标注「长按 Xms 启动」。
+
+        启动流程正在展示状态文案（注入中 / 已注入 / 失败原因等）时优先保留
+        状态文案——否则用户在设置页改个防误触就会把「正在注入…」冲掉。
+        """
+        status_tip = getattr(self, "_launch_status_tip", "")
+        if status_tip:
+            self._btn_start.setToolTip(status_tip)
+            return
         if resolve_launch_hold_enabled(self._config):
             self._btn_start.setToolTip(
                 f"长按 {resolve_launch_hold_ms(self._config)} 毫秒启动（防误触）")
@@ -1666,8 +1694,9 @@ class HomeWindow(CenteredPopupMixin, QWidget):
             btn.setEnabled(True)
         # 注入期间同样算忙碌：保持不透明
         self._fade.hold("busy", state == "injecting")
-        if detail:
-            btn.setToolTip(detail)
+        # 记住状态文案：_refresh_start_tooltip 需据此让位（见其注释）。
+        self._launch_status_tip = detail or ""
+        self._refresh_start_tooltip()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key_Escape:
